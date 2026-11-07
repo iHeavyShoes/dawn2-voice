@@ -17,11 +17,12 @@ description: >-
   microphone audio and streams it from the renderer to generativelanguage.googleapis.com; the
   backend calls the same host to mint the token with GEMINI_API_KEY (read through Hermes' secret
   scope). Delegated requests, Hermes' answers (as text) and the recent spoken turns are sent to
-  Gemini. Call transcripts are written to the plugin's Desktop data folder and, by default, as one
+  Gemini. The profile's SOUL.md is read only for the agent's name, which is the only part sent.
+  Call transcripts are written to the plugin's Desktop data folder and, by default, as one
   queued turn in the open chat. No shell commands, background processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.1.0"
+version: "0.2.0"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"

@@ -47,13 +47,45 @@ Without the key the button is disabled and its tooltip says exactly what to add.
 | Key | Default | Meaning |
 |---|---|---|
 | `model` | `gemini-3.8-live` | Live model. `gemini-3.8-live` delegates reliably; `-extended-thinking` decides to answer itself about 3 times in 5 (measured by hermes-gemini-live). |
-| `voice` | `Aoede` | Gemini prebuilt voice. Unknown names fall back to the default (the endpoint would silently do so anyway). |
-| `language` | `he` | Starting language: `he`, `en` or `auto`. |
+| `voice` | `auto` | `auto`: `Charon` (male) or `Aoede` (female) by the persona's gender. Or any Gemini prebuilt voice: male `Charon`, `Puck`, `Fenrir`, `Orus`, `Iapetus`, ...; female `Aoede`, `Kore`, `Leda`, `Zephyr`, ... Unknown names fall back to `auto`. |
+| `persona_name` | empty | Who the voice is. Empty: the agent name from this profile's `SOUL.md` (`You are Ray (in Hebrew exactly ריי)` gives `Ray`/`ריי`), else `Hermes`. |
+| `persona_gender` | `auto` | `male`, `female` or `auto` (an explicit `Gender:`/`Pronouns:`/`לשון זכר` line in SOUL.md, else the voice's sound, else male). Sets the Hebrew grammatical forms. |
+| `language` | `he` | Starting language: `he`, `en`, any BCP-47 code, or `auto`. |
+| `transcription_languages` | empty | BCP-47 hints for input transcription (`he-IL, en-US`). Empty: the starting language plus English/Hebrew, so switching keeps working. `auto`: no hints. |
+| `vocabulary` | empty | Comma-separated names/terms the input transcription should spell right (up to 100; the persona name is always added). |
 | `silence_ms` | `1000` | End-of-turn silence, 400-5000 ms. |
 | `instructions` | empty | Extra persona text. |
 | `transcript_to_chat` | `chat_turn` | `chat_turn`: one queued turn in the open chat at hang-up + data-folder file. `file`: data folder only. `off`: nothing. |
 | `half_duplex` | `false` | Mute the mic while the voice speaks (loudspeakers that beat echo cancellation). Disables barge-in. |
 | `api_version` | `v1alpha` | API version for the ephemeral token and socket. Both official Google SDKs use `v1alpha` for ephemeral tokens. |
+
+### Changing the voice, persona and language
+
+Settings are per profile (each profile's own `config.yaml`; the routes read the profile the
+request is scoped to). Either use **Desktop → Plugins → Gemini Live → Settings**, or the CLI:
+
+```
+hermes -p ray config set plugins.entries.gemini-live-chat.settings.voice Puck
+hermes -p ray config set plugins.entries.gemini-live-chat.settings.persona_gender male
+hermes -p ray config set plugins.entries.gemini-live-chat.settings.language he
+hermes -p ray config set plugins.entries.gemini-live-chat.settings.transcription_languages "he-IL,en-US"
+hermes -p ray config set plugins.entries.gemini-live-chat.settings.vocabulary "Acme,יומן"
+```
+
+A change applies from the **next** call (each call mints a token whose setup is locked); no restart.
+Asked mid-call, the voice says exactly that rather than inventing an answer. Hover the composer
+button to see the effective persona and voice.
+
+### What the Live API supports for language (checked 2026-11-07)
+
+- `inputAudioTranscription.languageCodes[]` (BCP-47 hints) and `customVocabulary[]` (up to 1000
+  terms; this plugin caps at 100, Google's recommendation): used. They shape the *transcript* (the
+  chat record and the `voice_context` Hermes reads), which was the source of "בוטידוג מחר".
+- `speechConfig.languageCode`: deliberately **not** set. On native-audio Live models the model picks
+  the spoken language itself; pinning it would break switching to English. The persona's language
+  policy steers it instead.
+- There is no separate input-recognition language for what the voice *model* hears; it hears the
+  audio directly.
 
 ## Cost and privacy
 
@@ -83,7 +115,8 @@ Desktop renderer (desktop/plugin.js)                 Hermes backend (dashboard/p
   mic 16 kHz PCM ─▶ realtimeInput.audio      audio 24 kHz ◀─ serverContent.modelTurn
   toolCall hermes_task ─▶ toolResponse "WORK_STARTED" (at once)
                        └▶ host.request('prompt.submit', {session_id, text, surface:'voice-live', voice_context})
-  message.complete (same chat) ─▶ realtimeInput.text "[Hermes result] …" when the voice is quiet
+  message.interim + message.complete (same chat, any turn while live)
+                       ─▶ realtimeInput.text "[Hermes result] …" when the voice is quiet
   goAway ─▶ new token with the last resumption handle, swap sockets, keep the mic
   hang-up ─▶ tearDown(): sockets, mic tracks, AudioContexts, timers; transcript saved once
 ```
@@ -104,7 +137,9 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 
 - Network: the backend calls `generativelanguage.googleapis.com` (token creation); the renderer
   opens a WebSocket to the same host. Audio goes to Google; nothing else leaves the machine.
-- Reads: `GEMINI_API_KEY` through Hermes' secret scope, this plugin's own settings.
+- Reads: `GEMINI_API_KEY` through Hermes' secret scope, this plugin's own settings, and the first
+  16 KB of the profile's `SOUL.md` to take the agent's **name** (and an explicitly stated gender).
+  Only the name is sent to Google; the SOUL text is not.
 - Writes: call transcripts in the plugin's Desktop data folder (`ctx.files`, `data`), and one
   queued turn per call in the open chat (unless `transcript_to_chat` says otherwise).
 - No shell commands, no background processes, no telemetry, no self-update.
@@ -114,8 +149,13 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 - **The transcript note is a turn.** The Desktop SDK has no supported way to append a non-turn
   note to a chat, so `chat_turn` submits the transcript as a normal queued turn that Hermes
   acknowledges in one line (a small extra model call). Set `file` to avoid it.
-- **Results wait for a pause.** Gemini Live has no function-response scheduling on this endpoint,
-  so a Hermes result is handed to the voice when it next stops speaking.
+- **Results wait for a pause.** A Hermes reply is handed to the voice (`realtimeInput.text`) when it
+  next stops speaking, or after 4 s with no audio if a model turn never closes. Every assistant
+  reply on the pinned chat counts while the call is up, not only the reply to the delegation: an
+  answer from a sub-agent that lands in a later turn ~20 s afterwards is spoken too, and interim
+  assistant messages of a turn are included. `FunctionResponse.scheduling` is not used: Google's
+  reference puts it on the FunctionResponse, the Live tools guide inside `response`, and it was not
+  measured against the live endpoint.
 - **Long calls.** Context compression is on; Google's `goAway` is handled by resuming on a new token.
 - **Backend responses are buffered.** With `plugins.isolation: host` the dashboard API runs in the
   plugin host, which buffers responses. The plugin's two routes (`GET /status`, `POST /session`)

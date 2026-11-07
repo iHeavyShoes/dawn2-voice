@@ -1,5 +1,5 @@
 name: gemini-live-chat
-version: "0.1.0"
+version: "0.2.0"
 manifest_version: 1
 kind: standalone
 description: "Full-duplex Google Gemini Live voice in Hermes Desktop that delegates every real request into the chat you have open (prompt.submit, surface voice-live, with the recent spoken turns as voice_context), so nothing said on the call is lost. Hebrew-first with live language switching, barge-in, transcript saved to the chat at hang-up, and a stop path that leaves no socket, microphone or process behind. The Gemini key stays on the server: the renderer gets a single-use, setup-locked ephemeral token."
@@ -16,8 +16,12 @@ requires_env:
 requires_hermes: ">=0.21.5"
 config_schema:
   model: {type: str, default: "gemini-3.8-live", label: "Live model", description: "Gemini Live model id. gemini-3.8-live is the most reliable at delegating; -extended-thinking delegates far less often."}
-  voice: {type: str, default: "Aoede", label: "Voice", description: "A Gemini prebuilt voice name (Aoede, Kore, Puck, Charon, ...)"}
-  language: {type: str, default: "he", label: "Starting language", description: "he, en or auto. The voice follows whichever language you speak."}
+  voice: {type: str, default: "auto", label: "Voice", description: "auto (Charon for a male persona, Aoede for a female one) or a Gemini prebuilt voice name (male: Charon, Puck, Fenrir, Orus, ...; female: Aoede, Kore, Leda, Zephyr, ...)"}
+  persona_name: {type: str, default: "", label: "Persona name", description: "Who the voice is. Empty: the agent name from this profile's SOUL.md (e.g. Ray), else Hermes. Only the name is sent to Google."}
+  persona_gender: {type: str, choices: ["auto", "male", "female"], default: "auto", label: "Persona gender", description: "Grammatical gender of the voice (Hebrew forms). auto: SOUL.md if it states one, else the chosen voice, else male."}
+  language: {type: str, default: "he", label: "Starting language", description: "he, en, any BCP-47 code, or auto. The voice follows whichever language you speak."}
+  transcription_languages: {type: str, default: "", label: "Transcription languages", description: "BCP-47 hints for input transcription, comma separated (he-IL, en-US). Empty: the starting language plus English/Hebrew. auto: no hints."}
+  vocabulary: {type: str, default: "", label: "Vocabulary", description: "Comma-separated names and terms the input transcription should spell right (the persona name is always added)."}
   silence_ms: {type: int, default: 1000, label: "End-of-turn silence (ms)", description: "400-5000"}
   instructions: {type: str, default: "", label: "Extra instructions", description: "Appended to the voice persona"}
   transcript_to_chat: {type: str, choices: ["chat_turn", "file", "off"], default: "chat_turn", label: "Save the call transcript", description: "chat_turn: one queued turn in the open chat at hang-up; file: plugin data folder only; off"}
