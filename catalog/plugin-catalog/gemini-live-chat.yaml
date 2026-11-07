@@ -23,7 +23,7 @@ description: >-
   queued turn in the open chat. No shell commands, background processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.3.0"
+version: "0.3.1"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"

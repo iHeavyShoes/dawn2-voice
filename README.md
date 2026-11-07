@@ -16,8 +16,10 @@ call is lost.
   minute of speech, one per model turn, so a long explanation is read out instead of summarised.
   Very long replies stop after about ten minutes and say the rest is in the chat. A reply that is
   Hermes' silence sentinel (`[SILENT]`, `NO_REPLY`, as on Hermes' autonomous lanes) is not spoken.
-- **Transcript persisted.** At hang-up the whole spoken transcript is submitted once to the same
-  chat as a queued turn (and also written to the plugin's own data folder). Configurable.
+- **Transcript persisted and checked.** At hang-up the whole spoken transcript is submitted once to
+  the same chat as a queued turn (and also written to the plugin's own data folder). Configurable.
+  The turn asks Hermes to check the call for any request that was not delegated or not answered in
+  the chat and to tell you or handle it; if nothing was missed it replies with one short line.
 - **Hebrew first, switch any time.** The voice starts in Hebrew (configurable) and answers in
   whichever language you spoke last.
 - **Barge-in.** Talk over the voice and it stops at once (Gemini's server VAD plus a local flush of
@@ -82,6 +84,43 @@ hermes -p ray config set plugins.entries.gemini-live-chat.settings.vocabulary "A
 A change applies from the **next** call (each call mints a token whose setup is locked); no restart.
 Asked mid-call, the voice says exactly that rather than inventing an answer. Hover the composer
 button to see the effective persona and voice.
+
+### On a phone: earpiece instead of loudspeaker (Chrome on Android)
+
+Once the microphone opens, Chrome on Android puts the phone in *communication* (VoIP) audio mode,
+the same mode a phone call uses, so the voice can come out of the quiet earpiece instead of the
+loudspeaker. A web page cannot fix this from code (checked against Chromium `main`, 2026-11-07):
+
+- `AudioContext.setSinkId()` / `HTMLMediaElement.setSinkId()` are not available on Chrome for Android,
+  and Chromium's Android audio manager lists only a `default` output device to pages.
+- The output route follows the *communication device* Chromium picks when the mic opens (wired
+  headset, USB, Bluetooth, else speakerphone); the earpiece is the phone's own routing for that mode,
+  and the Desktop SDK gives a plugin no control over it.
+- Echo cancellation (`echoCancellation: true`) is what keeps full duplex and barge-in usable on a
+  loudspeaker, so turning it off to leave communication mode is not an option.
+
+What works:
+
+1. **Headphones or a Bluetooth headset/speaker** (best: no echo either). Connect them before you
+   start the call; Chromium chooses the route when the mic opens.
+2. **Switch the output during the call** from Android's own controls: the volume panel's *output /
+   cast* button or the media output switcher in Quick Settings, where your Android version shows
+   it (Android 11+ on most phones), and pick the phone speaker.
+3. **Volume keys during the call** set the *call* volume, not the media volume; raise them once
+   the call is live.
+4. On a loud speaker, if the voice starts answering itself, set `half_duplex: true` (no barge-in).
+
+### Choosing another male voice
+
+`Charon` is the `auto` male voice. If its "s" sounds sharp or whistling (more noticeable on a phone
+earpiece), try these Gemini prebuilt male voices (Google's own labels in brackets): `Algieba`
+(smooth), `Schedar` (even), `Umbriel` (easy-going), `Orus` (firm), `Algenib` (gravelly),
+`Iapetus` (clear), `Achird` (friendly), `Sadaltager` (knowledgeable), `Rasalgethi` (informative),
+`Enceladus` (breathy), `Puck` (upbeat), `Fenrir` (excitable), `Sadachbia` (lively),
+`Zubenelgenubi` (casual). Smooth, even and gravelly voices usually carry less sibilance; Google AI
+Studio's voice picker plays a sample of each. Set one with
+`hermes -p <profile> config set plugins.entries.gemini-live-chat.settings.voice Algieba`; it applies
+from the next call, and the persona stays male because the voice is labelled male.
 
 ### What the Live API supports for language (checked 2026-11-07)
 
@@ -154,8 +193,8 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 ## Limitations
 
 - **The transcript note is a turn.** The Desktop SDK has no supported way to append a non-turn
-  note to a chat, so `chat_turn` submits the transcript as a normal queued turn that Hermes
-  acknowledges in one line (a small extra model call). Set `file` to avoid it.
+  note to a chat, so `chat_turn` submits the transcript as a normal queued turn (a small extra
+  model call) in which Hermes looks for anything the call missed. Set `file` to avoid it.
 - **Results wait for a pause.** A Hermes reply is handed to the voice (`realtimeInput.text`) when it
   next stops speaking and you are not talking, or after 4 s with no audio if a model turn never
   closes. Parts of a long reply follow one per model turn (or after 8 s if a turn never closes).
@@ -177,7 +216,7 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
 python -m pytest -q                   # 36 tests: token minting, setup lock, key handling, routes, persona
-node --test tests/js/                 # 37 tests: delegation seam, result hand-off, barge-in, transcript, stop path
+node --test 'tests/js/*.test.mjs'     # 37 tests: delegation seam, result hand-off, barge-in, transcript, stop path
 hermes plugins validate . --install-deps
 ```
 
