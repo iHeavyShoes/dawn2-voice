@@ -66,6 +66,7 @@ Without the key the button is disabled and its tooltip says exactly what to add.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `brain` | `hermes` | `hermes`: every substantive spoken turn goes to the Hermes chat model; the voice model only listens and reads. `voice`: the v0.5 behaviour (the voice model chats and decides when to delegate). See [Hermes is the brain](#hermes-is-the-brain-v06). |
 | `providers` | `gemini-free,openai-codex,gemini-paid` | The fallback chain, in order. Drop an id to never use it. |
 | `openai_model` | `gpt-realtime-2.1` | OpenAI Realtime model for `openai-codex` (`gpt-realtime*`). |
 | `openai_voice` | `auto` | `auto`: `cedar` (male) or `marin` (female) by the persona. Or `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`. |
@@ -278,6 +279,84 @@ id, repo). It is not done here: the plugin id is the folder name, the settings k
 (`plugins.entries.gemini-live-chat`) and the Desktop data folder, so a rename moves settings and
 transcripts and needs one coordinated step (rename the GitHub repo, move the folder, copy the
 settings block).
+
+## Hermes is the brain (v0.6)
+
+With `brain: hermes` (the default) the voice model is only the ears and the mouth. Every answer
+with content comes from the chat's own model (the one Hermes runs for that chat), never from
+Gemini or GPT Realtime. Prompt rules alone did not hold this: on v0.5, Gemini answered "what's
+left to do in this session?" and "should I use my reset?" by itself. So the decision moved out of
+the model and into code.
+
+**Who decides.** The renderer classifies every final user transcript with a small local
+rule-based classifier (`classifyTurn`, Hebrew and English, no network):
+
+| Kind | Examples | What happens |
+|---|---|---|
+| `greeting` | "hi", "שלום", "מה נשמע" | a fixed local line ("היי, אני כאן.") |
+| `ack` / `short` | "ok", "כן", "תודה", "מגניב", one word with no question and no request verb | nothing (a backchannel); resumes a reply that was interrupted |
+| `repeat` | "repeat that", "תחזור על זה" | the last Hermes reply is read again, locally |
+| `stop` / `bye` | "stop", "די", "ביי" | playback stops / a local "bye" |
+| `substantive` | everything else | `prompt.submit` on the pinned chat (surface `voice-live`, `voice_context`) |
+
+A turn is trivial only if all of its words are covered by those phrase lists (fillers, "please"
+and the persona's name are ignored). Any question mark, question word or request verb
+(`תבדוק`, `תמשיך`, "check") makes it substantive. When Hermes' last reply ended with a question,
+"yes" or "no" is an answer and goes to Hermes too.
+
+**How the voice model is kept quiet.** It gets a relay persona ("you are only the voice; speak
+only text tagged `[Say aloud]`, word for word") and **no tools**, so it can neither delegate, answer
+on its own initiative, nor hang up. On top of that, each provider has its own control:
+
+| Provider | Control | Deterministic? |
+|---|---|---|
+| OpenAI Realtime (`openai-codex`) | `turn_detection: {type: server_vad, create_response: false, interrupt_response: true}`. Server VAD still detects turns, transcribes and cancels on barge-in, but never creates a response. The renderer creates each one itself: `response.create` with `conversation: "none"` (out of band), whose only input is the text to read plus per-response read-verbatim instructions. | Yes: the model never produces a turn we did not request, and the request contains no user audio. |
+| Gemini Live (`gemini-free`, `gemini-paid`) | Gemini Live has no "detect but don't respond" switch. Manual activity control (`automaticActivityDetection.disabled` + `activityStart/End`) would need our own VAD in the renderer and lose server barge-in. So: automatic VAD stays on, Hermes' text goes in as `realtimeInput.text` tagged `[Say aloud]`, and the renderer **gates the output**: a model turn that follows text we handed over (`pendingHand`) is played; any other turn is the voice model's own and is neither played nor written to the transcript. Its first output (or empty `turnComplete`) is used only as the end-of-turn signal. | Yes for what the user hears. The model may still generate a turn server-side, which costs a little output audio, but it never reaches the speaker. |
+
+**Streaming.** Hermes' reply is spoken while it is being written. The renderer subscribes to
+`message.start`, `message.delta` (text chunks; `text: null` is a segment boundary before tool
+lines), `message.interim` and `message.complete` on the pinned chat. It cuts the text into
+sentences (`. ! ? …` plus Hebrew/CJK equivalents, line breaks; a run with no sentence end longer
+than about 120 characters is cut at the last space). Each sentence goes to the voice as soon as it
+is complete. Only assistant text reaches the voice: tool progress lines are separate events and are
+never read. At `message.complete` the final text is cut the same way and reconciled with what was
+already read: every sentence not yet read is read, and none is read twice (the full-readout
+guarantee). A silent reply (`[SILENT]`, `NO_REPLY`) is never read. Long replies are capped as
+before, ending with "the rest is in the chat".
+
+**Ack.** If Hermes has not produced its first sentence 900 ms after the turn was submitted, the voice
+says "בודק." / "Checking." once. On a fast answer, nothing is said before it.
+
+**Barge-in and corrections.** Speech during a reply stops playback, and what is left of that reply
+is held for up to 2.5 s until the user's words are known. A backchannel ("ok", "כן") or noise
+resumes it. Anything substantive drops it and goes to Hermes as a new turn on the same chat (Hermes
+core queues it after, or steers, the running turn, so it acts as a follow-up or correction).
+"Stop" drops everything queued.
+
+**Fast-answer hint.** Each delegated turn adds a model-only line to `voice_context`: *answer first
+in one short spoken sentence, then add detail only if needed; don't deliberate at length unless
+the question requires it.* `prompt.submit` has no per-turn reasoning-effort field (it reads
+`text`, `surface`, `voice_context`, `voice_turn` and display fields; `reasoning_effort` is only a
+per-session override on session create, which would change the chat for typed turns too), so the
+note is the only hint. The model is not changed.
+
+**Latency trade-off.** Every substantive turn waits for the chat model instead of a voice model
+that answers in about 0.5 s. Baseline before streaming (agent.log, prompt received → reply ready,
+`voice-live` turns, measured by Ray): about 3–7 s for simple turns, about 12 s with a short tool
+check, about 46 s with longer tool work. Streaming moves first audio to "first sentence written +
+voice TTS start". The target is about 2–3 s after the user stops on simple questions; the "checking"
+ack covers anything slower. Greetings, acks, "repeat" and "stop" stay local and instant. If you
+prefer speed over always getting the chat model's answer, set `brain: voice`.
+
+**Measuring.** The renderer logs one line per delegated turn to the gateway log, with numbers only:
+
+```
+gemini-live-chat: voice latency provider=gemini-free brain=hermes kind=turn eos->submit=412ms eos->first_text=2310ms eos->first_audio=1310ms eos->first_answer_audio=2890ms ack=yes silence_ms=1000
+```
+
+`eos` is the provider's end-of-speech signal, so add `silence_ms` to get "user stopped talking →
+first audio". `kind=abandoned` marks a turn superseded before it got an answer. Compare these lines
+before and after a change; the measured numbers belong here once Ray has a call's worth of lines.
 
 ## How it works
 

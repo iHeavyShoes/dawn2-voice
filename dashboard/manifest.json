@@ -3,7 +3,7 @@
   "label": "Live voice",
   "description": "Short-lived voice sessions for the Desktop call on a provider chain (Gemini free, ChatGPT/Codex, Gemini paid); no credential reaches the renderer.",
   "icon": "MessageSquare",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "tab": { "path": "/gemini-live-chat", "hidden": true },
   "api": "plugin_api.py"
 }
