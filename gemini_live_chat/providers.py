@@ -53,16 +53,41 @@ PROVIDERS: Dict[str, Provider] = {
 DEFAULT_ORDER: Tuple[str, ...] = (GEMINI_FREE, OPENAI_CODEX, GEMINI_PAID)
 
 #: Why a provider did not serve. The renderer uses the same words for mid-call failures.
-REASONS = ("no_key", "not_signed_in", "unsupported", "quota", "auth", "unavailable", "unreachable",
-           "rejected", "excluded", "network", "expired")
+REASONS = ("no_key", "not_signed_in", "unsupported", "quota", "billing", "auth", "unavailable",
+           "unreachable", "rejected", "excluded", "network", "expired")
 _REASON_TEXT = {
     "no_key": "no key", "not_signed_in": "not signed in", "unsupported": "this Hermes is too old",
-    "quota": "quota or rate limit", "auth": "credential refused", "unavailable": "service unavailable",
-    "unreachable": "unreachable", "rejected": "request refused", "excluded": "skipped on this call",
-    "network": "connection lost", "expired": "session expired",
+    "quota": "quota or rate limit", "billing": "no credit / billing", "auth": "credential refused",
+    "unavailable": "service unavailable", "unreachable": "unreachable", "rejected": "request refused",
+    "excluded": "skipped on this call", "network": "connection lost", "expired": "session expired",
 }
 #: Reasons that mean "not set up" rather than "tried and refused".
 UNCONFIGURED = ("no_key", "not_signed_in", "unsupported")
+#: Refusals worth remembering between calls (shown in the picker until the provider serves again).
+REMEMBERED = ("quota", "billing", "auth", "not_signed_in")
+
+#: The user's provider choice (the picker): ``auto`` walks the configured chain; a provider id
+#: uses only that provider, with no fallback.
+AUTO = "auto"
+CHOICES: Tuple[str, ...] = (AUTO,) + tuple(PROVIDERS)
+
+
+def clean_choice(raw: Any) -> Optional[str]:
+    return raw if isinstance(raw, str) and raw in CHOICES else None
+
+
+def order_for(choice: Optional[str], configured: Sequence[str]) -> List[str]:
+    """The providers a call may use: the configured chain for ``auto``, else the chosen one only."""
+    return [choice] if choice in PROVIDERS else list(configured)
+
+
+def reason_text(reason: Optional[str]) -> str:
+    return _REASON_TEXT.get(reason or "", reason or "")
+
+
+def unavailable_text(provider_id: str, reason: Optional[str]) -> str:
+    """``gemini-paid unavailable: no credit / billing`` (the picker tooltip and the spoken notice)."""
+    return f"{provider_id} unavailable: {reason_text(reason)}"
 
 
 @dataclass
@@ -137,6 +162,61 @@ def describe(order: Sequence[str], src: Sources) -> List[Dict[str, Any]]:
     return out
 
 
+_HINTS = {
+    "gemini-free": {"ready": "GEMINI_API_KEY is set",
+                    "no_key": "add GEMINI_API_KEY to this Hermes profile's .env"},
+    "gemini-paid": {"ready": "GEMINI_API_KEY_PAID is set",
+                    "no_key": "add GEMINI_API_KEY_PAID to this Hermes profile's .env"},
+    "openai-codex": {"ready": "uses the ChatGPT/Codex sign-in in Hermes (checked when a call starts)",
+                     "unsupported": "this Hermes cannot sign Codex requests for plugins; update Hermes"},
+}
+
+
+def picker(order: Sequence[str], src: Sources, health: Dict[str, Dict[str, Any]],
+           choice: str) -> List[Dict[str, Any]]:
+    """The picker's options: Auto, then every provider (configured chain order first).
+
+    ``state`` per provider:
+
+    * ``ready``: can be tried (key present / signer present, nothing refused it lately).
+    * ``refused``: can be tried, but its last attempt was refused (quota, billing, auth, not signed
+      in); ``detail`` says ``<id> unavailable: <reason>``. Still selectable: the refusal may be over
+      (credit added, signed in again), and only a real attempt can tell.
+    * ``missing``: cannot be tried at all (no key, this Hermes cannot sign): greyed out.
+
+    Only presence and remembered enums: no key, token or vendor text.
+    """
+    ids = list(dict.fromkeys(list(order) + list(PROVIDERS)))
+    options: List[Dict[str, Any]] = []
+    chain = []
+    for pid in ids:
+        p = PROVIDERS[pid]
+        ok, reason = readiness(pid, src)
+        last = health.get(pid) or {}
+        hints = _HINTS[pid]
+        if not ok:
+            state, why = "missing", reason
+            detail = f"{unavailable_text(pid, reason)} ({hints.get(reason, reason_text(reason))})"
+        elif last.get("reason"):
+            state, why = "refused", last["reason"]
+            detail = unavailable_text(pid, why)
+            if why == "billing":
+                detail += " (add credit or billing in Google AI Studio)"
+            elif why == "not_signed_in":
+                detail += " (sign in to OpenAI Codex under Providers in Hermes)"
+        else:
+            state, why, detail = "ready", None, hints["ready"]
+        if pid in order and state != "missing":
+            chain.append(p.label)
+        options.append({"id": pid, "label": p.label, "state": state, "reason": why, "detail": detail,
+                        "in_chain": pid in order, "last_at": last.get("at"), "selected": choice == pid})
+    auto = {"id": AUTO, "label": "Auto (fallback chain)", "state": "ready" if chain else "missing",
+            "reason": None if chain else "no_key",
+            "detail": " -> ".join(chain) if chain else "No provider of the chain can start.",
+            "in_chain": True, "last_at": None, "selected": choice == AUTO}
+    return [auto] + options
+
+
 def _mint_one(provider_id: str, cfg: Dict[str, Any], src: Sources, resume_handle: Optional[str],
               carry: str) -> Dict[str, Any]:
     p = PROVIDERS[provider_id]
@@ -193,7 +273,15 @@ def failure_message(attempts: Sequence[Dict[str, str]]) -> str:
         text += " Add GEMINI_API_KEY (Google AI Studio key) to this Hermes profile's .env."
     if any(a["reason"] == "not_signed_in" for a in attempts):
         text += " Sign in to OpenAI Codex under Providers in Hermes."
+    if any(a["reason"] == "billing" for a in attempts):
+        text += " Add credit or billing to the Google AI Studio account of the paid key."
     return text
+
+
+def pinned_failure_message(provider_id: str, attempts: Sequence[Dict[str, str]]) -> str:
+    """The one chosen provider could not start: say which, why, and offer Auto."""
+    reason = next((a["reason"] for a in attempts if a.get("provider") == provider_id), "unsupported")
+    return f"{unavailable_text(provider_id, reason)}. Switch the voice provider to Auto to use the fallback chain."
 
 
 _SAFE = re.compile(r"[^a-z0-9_.\-:,]")

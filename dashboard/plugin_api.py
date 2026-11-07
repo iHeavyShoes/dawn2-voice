@@ -40,7 +40,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import live, openai_rt, providers  # noqa: E402
+from gemini_live_chat import live, openai_rt, prefs, providers  # noqa: E402
 
 logger = logging.getLogger("gemini-live-chat")
 router = APIRouter()
@@ -97,7 +97,30 @@ def _codex_post(url: str, body: Dict[str, Any], timeout: float) -> Tuple[int, An
 
 
 def _sources() -> providers.Sources:
-    return providers.Sources(secret=_secret, codex_post=_codex_post if _provider_requests() else None)
+    """One request's view of Hermes: each secret is read at most once per request."""
+    seen: Dict[str, str] = {}
+
+    def secret(name: str) -> str:
+        if name not in seen:
+            seen[name] = _secret(name)
+        return seen[name]
+
+    return providers.Sources(secret=secret, codex_post=_codex_post if _provider_requests() else None)
+
+
+_FALLBACK_STORE = prefs.MemoryStore()
+
+
+def _prefs() -> prefs.Prefs:
+    """The picker's state for the profile this request is scoped to, in the plugin's own data dir
+    (``<HERMES_HOME>/plugin-data/<namespace>/state.json``) through Hermes' public plugin state API.
+    Never ``config.yaml``. A Hermes without that API gets an in-memory store (lost on restart; the
+    status route says so)."""
+    try:
+        from hermes_cli.plugins_state import PluginState
+    except ImportError:
+        return prefs.Prefs(_FALLBACK_STORE)
+    return prefs.Prefs(PluginState(PLUGIN_ID))
 
 
 SOUL_READ_LIMIT = 16_384
@@ -131,16 +154,30 @@ def _settings() -> Dict[str, Any]:
     return live.resolve_persona(cfg, _soul_text())
 
 
+def _picker(cfg: Dict[str, Any], src: providers.Sources, p: prefs.Prefs) -> Dict[str, Any]:
+    choice = p.choice()
+    return {"choice": choice, "persistent": p.persistent,
+            "options": providers.picker(cfg["providers"], src, p.health(), choice)}
+
+
 @router.get("/status")
 def status() -> Dict[str, Any]:
     cfg = _settings()
-    chain = providers.describe(cfg["providers"], _sources())
-    ready = any(p["ready"] for p in chain)
-    only_gemini_free = [p["id"] for p in chain] == [providers.GEMINI_FREE]
+    src = _sources()
+    p = _prefs()
+    picker = _picker(cfg, src, p)
+    order = providers.order_for(picker["choice"], cfg["providers"])
+    chain = providers.describe(order, src)
+    ready = any(x["ready"] for x in chain)
+    only_gemini_free = [x["id"] for x in chain] == [providers.GEMINI_FREE] and picker["choice"] == providers.AUTO
     message = None
     if not ready:
-        message = NO_KEY_MESSAGE if only_gemini_free else providers.failure_message(
-            [{"provider": p["id"], "reason": p["reason"]} for p in chain])
+        if picker["choice"] != providers.AUTO:
+            message = providers.pinned_failure_message(
+                picker["choice"], [{"provider": x["id"], "reason": x["reason"]} for x in chain])
+        else:
+            message = NO_KEY_MESSAGE if only_gemini_free else providers.failure_message(
+                [{"provider": x["id"], "reason": x["reason"]} for x in chain])
     return {
         "available": ready,
         "reason": None if ready else "no_key",
@@ -148,37 +185,76 @@ def status() -> Dict[str, Any]:
         "settings": live.client_settings(cfg),
         "problems": cfg["problems"],
         "providers": chain,
+        # v0.5: the provider picker (choice, per-provider availability, remembered refusals).
+        "picker": picker,
     }
+
+
+@router.post("/choice")
+def set_choice(body: Optional[Dict[str, Any]] = None):
+    """Store the user's provider choice (``auto`` or one provider id) for this profile."""
+    body = body if isinstance(body, dict) else {}
+    choice = providers.clean_choice(body.get("choice"))
+    if choice is None:
+        return JSONResponse(status_code=400, content={"detail": {
+            "reason": "invalid", "message": f"choice must be one of: {', '.join(providers.CHOICES)}"}})
+    p = _prefs()
+    if not p.set_choice(choice):
+        return JSONResponse(status_code=500, content={"detail": {
+            "reason": "not_saved", "message": "The provider choice could not be saved."}})
+    logger.info("gemini-live-chat: voice provider choice set to %s", choice)
+    return _picker(_settings(), _sources(), p)
+
+
+@router.post("/report")
+def report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A refusal the renderer saw on the provider's own connection (mid-call quota, billing, auth),
+    remembered so the picker can show it. Ids and enums only."""
+    body = body if isinstance(body, dict) else {}
+    ok = _prefs().report(body.get("provider"), body.get("reason"))
+    if ok:
+        logger.info("gemini-live-chat: voice provider %s reported %s", body.get("provider"), body.get("reason"))
+    return {"recorded": ok}
 
 
 @router.post("/session")
 def session(body: Optional[Dict[str, Any]] = None):
     body = body if isinstance(body, dict) else {}
     cfg = _settings()
+    p = _prefs()
+    choice = p.choice()
+    pinned = choice != providers.AUTO
     only = body.get("provider") if body.get("provider") in providers.PROVIDERS else None
     switch_from = body.get("switch_from") if body.get("switch_from") in providers.PROVIDERS else None
     reason = providers.clean_reason(body.get("reason"))
     kind = "resume" if only else ("mid_call" if switch_from else "connect")
     minted, attempts = providers.connect(
-        cfg["providers"], cfg, _sources(),
-        exclude=providers.clean_ids(body.get("exclude")),
+        providers.order_for(choice, cfg["providers"]), cfg, _sources(),
+        # The user picked this one provider: a cooldown (advice) never skips it.
+        exclude=() if pinned else providers.clean_ids(body.get("exclude")),
         only=only,
         resume_handle=live.valid_handle(body.get("resume_handle")) if only else None,
         carry=body.get("carry") or "",
     )
+    p.record(attempts, served=minted["provider"] if minted else None)
     if minted is None:
-        logger.info("gemini-live-chat: no voice provider could serve (%s; %s)", kind,
+        logger.info("gemini-live-chat: no voice provider could serve (%s; choice=%s; %s)", kind, choice,
                     ",".join(f"{a['provider']}:{a['reason']}" for a in attempts) or "none configured")
         unconfigured = all(a["reason"] in providers.UNCONFIGURED for a in attempts)
-        if [a["provider"] for a in attempts] == [providers.GEMINI_FREE] and attempts[0]["reason"] == "no_key":
+        if pinned and not only:
+            message = providers.pinned_failure_message(choice, attempts)
+            reason_out = "pinned_unavailable"
+        elif [a["provider"] for a in attempts] == [providers.GEMINI_FREE] and attempts[0]["reason"] == "no_key":
             message = NO_KEY_MESSAGE
+            reason_out = "no_key"
         else:
             message = providers.failure_message(attempts)
-        # no_key: nothing is set up (v0.3 contract); exhausted: something was tried and refused.
-        reason_out = "no_key" if unconfigured else "exhausted"
+            # no_key: nothing is set up (v0.3 contract); exhausted: something was tried and refused.
+            reason_out = "no_key" if unconfigured else "exhausted"
         status_code = 503 if unconfigured or all(a["reason"] in providers.UNCONFIGURED + ("excluded",)
                                                  for a in attempts) else 502
-        return JSONResponse(status_code=status_code,
-                            content={"detail": {"reason": reason_out, "message": message, "attempts": attempts}})
+        return JSONResponse(status_code=status_code, content={"detail": {
+            "reason": reason_out, "message": message, "attempts": attempts, "choice": choice}})
     logger.info("gemini-live-chat: %s", providers.log_line(minted, kind, switch_from, reason))
+    minted["choice"] = choice
     return minted

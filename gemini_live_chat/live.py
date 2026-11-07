@@ -297,10 +297,21 @@ def valid_handle(handle: Any) -> Optional[str]:
     return None
 
 
+#: Words Google uses when a billed account cannot pay: the Prepay "$0 credit balance" refusal
+#: (HTTP 402 Payment Required, every key on that billing account), and billing-disabled or
+#: billing-required bodies that arrive as 400/403/429.
+_BILLING_RE = re.compile(r"billing|prepa(y|id)|payment.required|credit.balance|insufficient.(credit|fund|balance)"
+                         r"|out of credit|no credit")
+
+
 def classify(status: int, detail: Any) -> str:
-    """Map a refused token request to a fallback reason (see ``providers.REASONS``): ``quota`` for
-    429 / RESOURCE_EXHAUSTED, ``auth`` for a bad or unauthorised key, ``unavailable`` for 5xx."""
+    """Map a refused token request to a fallback reason (see ``providers.REASONS``): ``billing`` for
+    402 Payment Required or a billing/credit body (checked first: Google can send it as 429
+    RESOURCE_EXHAUSTED or 403), ``quota`` for 429 / RESOURCE_EXHAUSTED, ``auth`` for a bad or
+    unauthorised key, ``unavailable`` for 5xx."""
     low = json.dumps(detail).lower() if not isinstance(detail, str) else detail.lower()
+    if status == 402 or (status in (400, 403, 429) and _BILLING_RE.search(low)):
+        return "billing"
     if status == 429 or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
         return "quota"
     if status in (401, 403) or "api_key_invalid" in low or "permission_denied" in low or "api key not valid" in low:
@@ -311,6 +322,8 @@ def classify(status: int, detail: Any) -> str:
 
 
 _REFUSALS = {
+    "billing": ("Google refused the Live token request: the billing account of {key_name} has no credit "
+                "or no billing ({status}). Add credit in Google AI Studio."),
     "quota": "Google refused the Live token request: quota or rate limit reached ({status}).",
     "auth": "Google refused the Live token request ({status}). Check that {key_name} is valid.",
     "unavailable": "Google's Live service is unavailable right now ({status}).",
