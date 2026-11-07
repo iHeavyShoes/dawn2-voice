@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: pytest (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies (7-day release quarantine)
+        # Release quarantine, as the Hermes plugin guide recommends: ignore any package
+        # release newer than 7 days, so a freshly compromised release cannot reach CI.
+        run: |
+          uv venv
+          uv pip install --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" -r requirements-dev.txt
+      - name: Run pytest
+        run: uv run --no-project python -B -m pytest -q
+
+  node:
+    name: node --test (desktop half)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run node tests
+        run: node --test tests/js/
