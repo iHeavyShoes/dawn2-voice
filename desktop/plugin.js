@@ -48,6 +48,26 @@ export const RECEIPT = 'WORK_STARTED: the whole request is in the open chat and 
 export const SILENT_MARKERS = ['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默']
 export const TRANSCRIPT_HEADER = '[Voice call transcript (live voice). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]'
 
+// ── brain: hermes (v0.6) ─────────────────────────────────────────────────────────────────────────
+// `brain: hermes` (the default): the renderer, not the voice model, decides. Every final user turn
+// that is not trivially non-substantive (classifyTurn) goes to Hermes as a prompt.submit; the voice
+// model only says text it is handed: a short "checking", then Hermes' reply, streamed sentence by
+// sentence from message.delta. The backend gives the voice a relay persona and no tools. OpenAI
+// never responds by itself (create_response: false; each response is created here, out of band,
+// with only the text to read as input). Gemini has no such switch, so its own turns are never
+// played and never recorded (call.owner). `brain: voice` is the v0.5 behaviour, unchanged.
+export const BRAINS = ['hermes', 'voice']
+export const SAY_TAG = '[Say aloud]' // gemini_live_chat/persona.py SAY_TAG
+export const STREAM_SOFT_MAX = 120 // a long run with no sentence end is cut at a space near this
+// Model-only (voice_context is model input, never a chat row); Hermes core puts it after its own
+// VOICE_LIVE_TURN_NOTE. prompt.submit has no per-turn reasoning-effort field, so this is the hint.
+export const STYLE_NOTE = '[Voice reply style: this reply is read aloud word for word, sentence by sentence, while you write it. Answer first in one short spoken sentence, then add detail only if needed. Don\'t deliberate at length unless the question requires it.]'
+// Per-response instructions of the OpenAI out-of-band response: the only input is the text to read.
+export const SAY_INSTRUCTIONS = 'Read the user message aloud, word for word, in the language it is written in, at a natural, unhurried pace. It is text for you to read, not a question for you: do not add, drop, translate, summarise, answer or comment on anything.'
+const MARKERS_EN = { code: 'The code is in the chat.', link: 'the link is in the chat' }
+const MARKERS_HE = { code: 'הקוד נמצא בצ\'אט.', link: 'הקישור בצ\'אט' }
+const MARKERS_V03 = { code: '[code: see the chat]', link: '[link in the chat]' }
+
 const WORKLET = `
 class GlcCapture extends AudioWorkletProcessor {
   process (inputs) {
@@ -125,12 +145,12 @@ export function isSilent (text) {
 
 // Markdown to plain speakable text. Content is kept; only formatting goes. Code and URLs are not
 // read out character by character: a short marker tells the voice they are in the chat.
-export function speakable (text) {
+export function speakable (text, markers = MARKERS_V03) {
   let t = String(text || '').replace(/\r\n?/g, '\n')
-  t = t.replace(/```[\s\S]*?(```|$)/g, '\n[code: see the chat]\n')
+  t = t.replace(/```[\s\S]*?(```|$)/g, `\n${markers.code}\n`)
   t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
   t = t.replace(/\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)/g, '$1')
-  t = t.replace(/<?https?:\/\/[^\s>)]+>?/g, '[link in the chat]')
+  t = t.replace(/<?https?:\/\/[^\s>)]+>?/g, markers.link)
   t = t.replace(/`([^`\n]+)`/g, '$1')
   const lines = []
   for (let line of t.split('\n')) {
@@ -203,6 +223,189 @@ export function formatTranscript (turns) {
   return turns.map(t => `${t.role === 'user' ? 'User' : 'Voice'}: ${t.text}`).join('\n')
 }
 
+// ── brain: hermes — pure helpers (unit tested) ───────────────────────────────────────────────────
+
+const norm = s => String(s || '').replace(/\s+/g, ' ').trim()
+
+// 'he' when the text has at least as many Hebrew letters as Latin ones, 'en' for Latin, else null.
+export function langOf (text) {
+  const t = String(text || '')
+  const he = (t.match(/[\u05D0-\u05EA]/g) || []).length
+  const lat = (t.match(/[A-Za-z]/g) || []).length
+  if (he && he >= lat) return 'he'
+  return lat ? 'en' : null
+}
+
+// Hermes' markdown as words to read verbatim, with the code/link notes in the reply's language.
+export function sayText (text) {
+  return speakable(text, langOf(text) === 'he' ? MARKERS_HE : MARKERS_EN)
+}
+
+// The turn classifier: small, local, rule based, Hebrew and English. A turn is trivially
+// non-substantive only when ALL of its words are covered by these phrases (fillers, "please" and
+// the persona's name are ignored), or when it is a single word with no question and no request
+// verb. Everything else is substantive and goes to Hermes. A yes/no or ack right after Hermes
+// asked a question is an answer, so it is substantive too (`awaiting`).
+const PHRASES = {
+  greeting: ['hi', 'hello', 'hey', 'hey there', 'hiya', 'yo', 'good morning', 'good afternoon', 'good evening',
+    'how are you', 'how are you doing', 'how is it going', 'hows it going', 'whats up', 'sup',
+    'היי', 'הי', 'הלו', 'שלום', 'אהלן', 'אהלן וסהלן', 'בוקר טוב', 'צהריים טובים', 'צהרים טובים', 'ערב טוב',
+    'מה נשמע', 'מה קורה', 'מה שלומך', 'מה המצב', 'מה העניינים', 'מה איתך', 'מה הולך'],
+  ack: ['ok', 'okay', 'k', 'kay', 'alright', 'all right', 'yes', 'yeah', 'yep', 'yup', 'sure', 'right', 'correct',
+    'exactly', 'got it', 'i see', 'understood', 'cool', 'nice', 'great', 'awesome', 'perfect', 'good', 'very good',
+    'fine', 'thanks', 'thank you', 'thank you very much', 'thanks a lot', 'mhm', 'mm', 'uhhuh', 'oh', 'wow', 'no',
+    'nope', 'no thanks', 'makes sense', 'sounds good', 'interesting', 'lovely', 'ah', 'aha',
+    'אוקיי', 'אוקי', 'אוקה', 'בסדר', 'בסדר גמור', 'כן', 'יופי', 'יופי טופי', 'מגניב', 'תודה', 'תודה רבה',
+    'סבבה', 'אחלה', 'נכון', 'הבנתי', 'ברור', 'וואו', 'וואלה', 'אהה', 'אהא', 'מעולה', 'נהדר', 'טוב',
+    'טוב מאוד', 'יפה', 'יפה מאוד', 'מצוין', 'מצויין', 'לא', 'לא תודה', 'הגיוני', 'מעניין', 'נשמע טוב',
+    'אש', 'יאללה', 'קיבלתי', 'אמממ', 'נו', 'וואי'],
+  repeat: ['repeat', 'repeat that', 'say that again', 'say again', 'again', 'one more time', 'come again',
+    'pardon', 'what did you say', 'i didnt catch that', 'i didnt hear', 'i didnt hear that', 'what', 'huh',
+    'sorry what', 'תחזור', 'תחזור על זה', 'תחזור שוב', 'חזור', 'חזור על זה', 'שוב', 'עוד פעם', 'עוד הפעם',
+    'מה אמרת', 'לא שמעתי', 'מה', 'הא', 'סליחה מה', 'תגיד שוב', 'תגיד עוד פעם'],
+  stop: ['stop', 'stop it', 'stop talking', 'enough', 'quiet', 'be quiet', 'shh', 'shush', 'hush', 'hold on',
+    'wait', 'wait a second', 'one second', 'pause', 'silence',
+    'עצור', 'תעצור', 'די', 'די כבר', 'מספיק', 'שקט', 'תפסיק', 'הפסק', 'רגע', 'רק רגע', 'שנייה', 'שניה',
+    'חכה', 'שתוק', 'תשתוק'],
+  bye: ['bye', 'bye bye', 'goodbye', 'good bye', 'good night', 'see you', 'see you later', 'talk later',
+    'talk to you later', 'later', 'hang up', 'end call', 'end the call', 'thats all', 'thats it for now',
+    'ביי', 'ביי ביי', 'להתראות', 'לילה טוב', 'נדבר', 'נדבר אחר כך', 'נדבר אחכ', 'תנתק', 'נתק',
+    'סיים שיחה', 'סיים את השיחה', 'זהו להיום', 'זהו זה', 'יאללה ביי']
+}
+const FILLERS = new Set(['um', 'umm', 'uh', 'uhh', 'hmm', 'hm', 'er', 'erm', 'please', 'אממ', 'אמ', 'אהמ', 'אההה', 'אה', 'בבקשה', 'hermes', 'הרמס'])
+const REQUEST_WORDS = new Set(['check', 'continue', 'explain', 'summarize', 'summarise', 'search', 'find', 'open',
+  'run', 'send', 'remind', 'read', 'write', 'show', 'tell', 'translate', 'fix', 'schedule', 'play', 'go', 'next',
+  'בדוק', 'המשך', 'הסבר', 'סכם', 'חפש', 'פתח', 'הרץ', 'שלח', 'קרא', 'כתוב', 'ספר', 'תרגם', 'תקן', 'נגן', 'הבא'])
+const QUESTION_WORDS = new Set(['what', 'who', 'how', 'why', 'when', 'where', 'which', 'can', 'could', 'should',
+  'would', 'is', 'are', 'do', 'does', 'did', 'will', 'מה', 'מי', 'איך', 'למה', 'מתי', 'איפה', 'כמה', 'האם',
+  'איזה', 'איזו', 'אילו', 'מדוע', 'היכן', 'לאן', 'מאיפה'])
+const PHRASE_INDEX = (() => {
+  const map = new Map() // first word -> [{ words, kind }], longest first
+  for (const [kind, list] of Object.entries(PHRASES)) {
+    for (const p of list) {
+      const words = p.split(' ')
+      if (!map.has(words[0])) map.set(words[0], [])
+      map.get(words[0]).push({ words, kind })
+    }
+  }
+  for (const list of map.values()) list.sort((a, b) => b.words.length - a.words.length)
+  return map
+})()
+const KIND_ORDER = ['bye', 'stop', 'repeat', 'greeting', 'ack']
+
+function words (text, names) {
+  const t = String(text || '').toLowerCase()
+    .replace(/[\u0591-\u05C7]/g, '') // niqqud and cantillation
+    .replace(/['’`׳"״]/g, '') // what's -> whats, צ'יפס -> ציפס
+    .replace(/\b(uh|mm)[\s-]*(huh|hm+)\b/g, 'uhhuh') // a backchannel, not "uh" + "huh?"
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+  return t.split(/\s+/).filter(w => w && !FILLERS.has(w) && !names.has(w))
+}
+
+// Every word covered by phrases (longest match first; a Hebrew "ו" prefix is allowed)?
+function cover (ws) {
+  const kinds = new Set()
+  let i = 0
+  while (i < ws.length) {
+    let hit = null
+    for (const w0 of [ws[i], ws[i].startsWith('ו') && ws[i].length > 2 ? ws[i].slice(1) : null]) {
+      if (!w0) continue
+      for (const cand of PHRASE_INDEX.get(w0) || []) {
+        const n = cand.words.length
+        if (cand.words.every((w, k) => (k === 0 ? w0 : ws[i + k]) === w)) { hit = cand; break }
+        if (n === 1 && cand.words[0] === w0) { hit = cand; break }
+      }
+      if (hit) break
+    }
+    if (!hit) return null
+    kinds.add(hit.kind)
+    i += hit.words.length
+  }
+  return kinds
+}
+
+// -> { kind, lang, words }. kind: empty | greeting | ack | repeat | stop | bye | short | substantive.
+export function classifyTurn (text, opts = {}) {
+  const names = new Set((opts.names || []).filter(Boolean).map(n => String(n).toLowerCase().replace(/['’`׳"״]/g, '')))
+  const raw = String(text || '')
+  const ws = words(raw, names)
+  const lang = langOf(raw)
+  const question = /[?？]/.test(raw) || (ws.length > 0 && QUESTION_WORDS.has(ws[0]) && ws.length > 1)
+  let kind
+  if (!ws.length) kind = 'empty'
+  else {
+    const kinds = cover(ws)
+    if (kinds) kind = KIND_ORDER.find(k => kinds.has(k))
+    else if (ws.length === 1 && !/[?？]/.test(raw) && !REQUEST_WORDS.has(ws[0]) && !QUESTION_WORDS.has(ws[0]) &&
+      !(/^ת[\u05D0-\u05EA]{3,}$/.test(ws[0]))) kind = 'short' // תבדוק, תמשיך, תסביר...: a request
+    else kind = 'substantive'
+  }
+  // An answer to Hermes' own question ("should I send it?" -> "yes") must reach Hermes.
+  if (opts.awaiting && (kind === 'ack' || kind === 'short')) kind = 'substantive'
+  return { kind, lang, question, words: ws.length }
+}
+export const SUBSTANTIVE = 'substantive'
+
+// Cut text into pieces to speak: at a sentence end followed by whitespace, at a line break, or, for
+// a long run with no sentence end, at the last space before `max` characters. Decisions only use
+// text up to `max + 1` characters ahead, so cutting a growing prefix yields the same leading pieces
+// as cutting the whole text (streaming and the final reconciliation agree). Not final: the
+// unfinished tail is held back (`rest`).
+const END_CHARS = '.!?…。！？'
+const CLOSERS = '.!?…"\'”’)]»'
+export function cutPieces (text, final, max = STREAM_SOFT_MAX) {
+  const s = String(text || '')
+  const n = s.length
+  const pieces = []
+  let i = 0
+  for (;;) {
+    while (i < n && /\s/.test(s[i])) i++
+    if (i >= n) break
+    let cut = -1
+    let wait = false
+    const lim = Math.min(n, i + max)
+    for (let j = i; j < lim; j++) {
+      const c = s[j]
+      if (c === '\n') { cut = j; break }
+      if (END_CHARS.includes(c)) {
+        let k = j + 1
+        while (k < n && CLOSERS.includes(s[k])) k++
+        if (k >= n) { if (final) cut = n; else wait = true; break }
+        if (/\s/.test(s[k])) { cut = k; break }
+        j = k - 1
+      }
+    }
+    if (wait) break
+    if (cut < 0) {
+      if (n - i > max) {
+        let at = s.lastIndexOf(' ', i + max)
+        if (at <= i + max / 2) at = i + max
+        cut = at
+      } else if (final) cut = n
+      else break
+    }
+    const piece = s.slice(i, cut).trim()
+    if (piece) pieces.push(piece)
+    i = cut
+  }
+  return { pieces, rest: s.slice(i) }
+}
+
+// The pieces not yet spoken: those after the longest leading run whose words are already in
+// `spoken` (normalised). A piece that differs is spoken whole: nothing is skipped; at worst a
+// fragment is repeated when Hermes' final text differs from what it streamed.
+export function freshPieces (pieces, spoken) {
+  const done = norm(spoken)
+  let acc = ''
+  let i = 0
+  for (; i < pieces.length; i++) {
+    const next = acc ? `${acc} ${norm(pieces[i])}` : norm(pieces[i])
+    if (done.startsWith(next) && (done.length === next.length || done[next.length] === ' ')) acc = next
+    else break
+  }
+  return pieces.slice(i)
+}
+
 // ── injectable environment (tests replace it) ────────────────────────────────────────────────────
 
 const defaultEnv = () => ({
@@ -234,7 +437,9 @@ const defaultEnv = () => ({
   },
   hasVoice: prefix => {
     try { return (globalThis.speechSynthesis ? globalThis.speechSynthesis.getVoices() : []).some(v => String(v.lang || '').toLowerCase().startsWith(prefix)) } catch { return false }
-  }
+  },
+  // v0.6: the per-turn latency line (numbers only) in the renderer console; the backend logs it too.
+  log: (...a) => { try { globalThis.console.info(...a) } catch { /* no console */ } }
 })
 let env = null
 const E = () => env || (env = defaultEnv())
@@ -399,6 +604,24 @@ export const call = {
   switching: false,
   providersUsed: [], // labels, in order, for the transcript
   choice: 'auto', // v0.5: the picker choice this call started with ('auto' or one provider id)
+  // v0.6 brain: hermes
+  brain: null, // 'hermes' | 'voice', from the minted session
+  owner: null, // gemini: whose model turn is open: 'hermes' (handed text), 'voice' (its own; never played), 'muted'
+  pendingHand: 0, // gemini: handed text whose turn has not started yet
+  userPending: false, // the user is mid-turn (heard, not finalised yet)
+  eosAt: 0, // when the provider's VAD ended the user's turn
+  finalTimer: null,
+  fallbackTimer: null,
+  ackTimer: null,
+  holdTimer: null,
+  held: null, // { group, items }: a reply interrupted by the user, until their words are known
+  dropped: new Set(), // reply groups never to be read again (barge-in, "stop")
+  stream: null, // the Hermes reply being streamed into the voice
+  lastReply: '', // for "repeat that"
+  awaitingAnswer: false, // Hermes' last reply ended with a question: a "yes" is an answer
+  lang: null, // the language the user speaks (from the classifier)
+  lastTurn: null, // the classifier's verdict on the last user turn
+  lat: null, // latency of the turn in flight
   settings: null,
   ctx: null,
   listeners: new Set()
@@ -422,16 +645,35 @@ const TRANSPORTS = {
   'gemini-live': {
     connected: () => !!call.ws,
     playing: () => !!(call.player && call.player.playing()),
-    handText: text => send({ realtimeInput: { text } }),
+    // brain: hermes: the text to read is tagged; the relay persona reads it word for word.
+    handText: (text, item) => send({ realtimeInput: { text: item && item.say ? `${SAY_TAG} ${text}` : text } }),
     answerTools: responses => send({ toolResponse: { functionResponses: responses } }),
-    stopPlayback: () => { call.player && call.player.flush() }
+    stopPlayback: () => {
+      call.player && call.player.flush()
+      if (call.owner === 'hermes') call.owner = 'muted' // the rest of that turn is not played
+    }
   },
   'openai-realtime': {
     connected: () => !!(call.rtc && call.rtc.open),
     playing: () => !!(call.rtc && call.rtc.speaking),
-    handText: text => {
-      rtcSend({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })
-      rtcSend({ type: 'response.create' })
+    handText: (text, item) => {
+      if (item && item.say) {
+        // brain: hermes. An out-of-band response (conversation "none") whose only input is the text
+        // to read: the voice model sees no conversation to answer, and nothing is added to it.
+        rtcSend({
+          type: 'response.create',
+          response: {
+            conversation: 'none',
+            instructions: SAY_INSTRUCTIONS,
+            output_modalities: ['audio'],
+            metadata: { glc: 'say' },
+            input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }]
+          }
+        })
+      } else {
+        rtcSend({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })
+        rtcSend({ type: 'response.create' })
+      }
       if (call.rtc) call.rtc.responding = true
     },
     answerTools: responses => {
@@ -442,7 +684,12 @@ const TRANSPORTS = {
       }
     },
     // The server stops its own audio on barge-in (interrupt_response); this clears what is buffered.
-    stopPlayback: () => rtcSend({ type: 'output_audio_buffer.clear' })
+    // brain: hermes also cancels a reading the user stopped by word ("stop"), not by voice.
+    stopPlayback: () => {
+      const rtc = call.rtc
+      if (rtc && rtc.responding && rtc.responseId && call.brain === 'hermes') rtcSend({ type: 'response.cancel', response_id: rtc.responseId })
+      rtcSend({ type: 'output_audio_buffer.clear' })
+    }
   }
 }
 const T = () => TRANSPORTS[(call.provider && call.provider.transport) || 'gemini-live']
@@ -466,7 +713,10 @@ export function voiceContext () {
     const t = call.partial[role].replace(/\s+/g, ' ').trim()
     if (t) turns.push({ role, text: t })
   }
-  return formatTranscript(turns.slice(-CONTEXT_TURNS)).slice(-6000)
+  const text = formatTranscript(turns.slice(-CONTEXT_TURNS))
+  if (call.brain !== 'hermes') return text.slice(-6000)
+  // v0.6: every reply is read aloud as it streams, so ask for the answer first.
+  return `${STYLE_NOTE}\n${text.slice(-(6000 - STYLE_NOTE.length - 1))}`
 }
 
 function detach (ws) {
@@ -509,7 +759,7 @@ function releaseTransport () {
   if (call.flushTimer) { E().clearTimeout(call.flushTimer); call.flushTimer = null }
   flushPartial('user')
   flushPartial('assistant')
-  Object.assign(call, { modelSpeaking: false, resumeHandle: null, lastAudioAt: 0 })
+  Object.assign(call, { modelSpeaking: false, resumeHandle: null, lastAudioAt: 0, owner: null, pendingHand: 0 })
 }
 
 async function saveTranscript (ctx, sid, turns, mode, used) {
@@ -536,6 +786,10 @@ export function tearDown (note) {
   const ctx = call.ctx
   const sid = call.sessionId
   call.gen += 1
+  latFlush('abandoned')
+  for (const t of ['finalTimer', 'fallbackTimer', 'ackTimer', 'holdTimer']) {
+    if (call[t]) { E().clearTimeout(call[t]); call[t] = null }
+  }
   releaseTransport()
   const turns = call.turns.slice()
   const used = call.providersUsed.slice()
@@ -544,7 +798,8 @@ export function tearDown (note) {
     state: 'idle', modelSpeaking: false, hangUp: false, queue: [], handing: false, handedAt: 0, lastHanded: null,
     interim: [], turns: [], lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0, provider: null, switching: false,
     partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null, tried: [], switches: 0, providersUsed: [],
-    choice: 'auto'
+    choice: 'auto', brain: null, owner: null, pendingHand: 0, userPending: false, eosAt: 0, held: null,
+    dropped: new Set(), stream: null, lastReply: '', awaitingAnswer: false, lang: null, lastTurn: null, lat: null
   })
   if (note !== undefined) call.detail = note
   publish()
@@ -557,8 +812,12 @@ export function tearDown (note) {
 // hold a Hermes result back for the rest of the call.
 function modelQuiet () {
   const now = E().now()
-  if (call.lastHeardAt && now - call.lastHeardAt < USER_QUIET_MS) return false
+  // brain: hermes knows exactly when the user's turn ends (userPending), so it needs no quiet window;
+  // nothing is read while the user is mid-turn (bounded: a lost end-of-turn signal)
+  if (call.brain !== 'hermes' && call.lastHeardAt && now - call.lastHeardAt < USER_QUIET_MS) return false
+  if (call.userPending && now - call.lastHeardAt < AWAIT_MS) return false
   if (call.handing && now - Math.max(call.handedAt, call.lastAudioAt) < AWAIT_MS) return false
+  if (call.handing) call.pendingHand = 0 // never answered: the next part goes ahead
   if (call.rtc && call.rtc.responding && now - Math.max(call.handedAt, call.lastAudioAt) < AWAIT_MS) return false
   if (!call.modelSpeaking) return true
   if (T().playing()) return false
@@ -572,6 +831,7 @@ function armFlushRetry () {
 
 // Queue one Hermes reply for the voice. Returns the number of messages queued (0: silent or empty).
 export function enqueueResult (text) {
+  if (isHermes()) return sayReply(text)
   const messages = resultMessages(text)
   if (!messages.length) return 0
   call.group += 1
@@ -587,13 +847,24 @@ export function enqueueResult (text) {
 export function flushResults () {
   if (!call.queue.length || !connected()) return
   if (!modelQuiet()) { armFlushRetry(); return }
-  const item = call.queue.shift()
+  let item = call.queue.shift()
+  if (item.say && item.kind === 'reply') { // ready sentences of one reply go as one message
+    let text = item.text
+    while (call.queue[0] && call.queue[0].group === item.group && call.queue[0].kind === 'reply' &&
+      text.length + 1 + call.queue[0].text.length <= MERGE_CHARS) text += ' ' + call.queue.shift().text
+    if (text !== item.text) item = { ...item, text }
+  }
   call.modelSpeaking = false
   call.handing = true
   call.handedAt = E().now()
   call.lastHanded = item
   call.speakingGroup = item.group
-  T().handText(item.text)
+  if (item.say) call.pendingHand = 1
+  if (item.bye) { // brain: hermes "bye": hang up once it is said (or after a grace period)
+    call.hangUp = true
+    if (!call.hangTimer) call.hangTimer = E().setTimeout(() => tearDown(''), HANGUP_GRACE_MS * 2)
+  }
+  T().handText(item.text, item)
   armFlushRetry() // the next part normally follows on turn completion; this covers a lost one
 }
 
@@ -653,9 +924,10 @@ function onToolCall (calls) {
 // Barge-in bookkeeping shared by both transports (the audio itself is stopped by the transport).
 function onBargeIn () {
   T().stopPlayback()
+  if (isHermes()) holdForBargeIn()
   call.modelSpeaking = false
   call.handing = false
-  dropSpeakingRest()
+  if (!isHermes()) dropSpeakingRest()
   flushPartial('assistant')
   armFlushRetry() // other replies wait until the user has finished (USER_QUIET_MS)
 }
@@ -667,11 +939,354 @@ function onReady () {
   if (call.switching) {
     call.switching = false
     call.detail = ''
-    call.queue.unshift({ text: SWITCH_NOTE, group: 0 })
+    if (isHermes()) call.queue.unshift({ text: localLine('switch'), group: 0, say: true, kind: 'local' })
+    else call.queue.unshift({ text: SWITCH_NOTE, group: 0 })
   }
   publish()
   flushResults()
   return true
+}
+
+// ── brain: hermes — runtime ──────────────────────────────────────────────────────────────────────
+
+export const ACK_DELAY_MS = 900 // "checking" is said only when Hermes has not started talking by then
+const FINAL_LAG_MS = 400 // gemini: transcription can trail the end-of-turn signal a little
+const FINAL_FALLBACK_MS = 1500 // gemini: no end-of-turn signal at all: finish the turn after silence + this
+const HOLD_MS = 2500 // an interrupted reply waits this long for the user's words before it is dropped
+const MERGE_CHARS = 600 // consecutive ready sentences of one reply are handed as one message
+const MAX_REPLY_CHARS = MAX_PARTS * PART_CHARS // same cap as v0.3's readout, then "the rest is in the chat"
+export const isHermes = () => call.brain === 'hermes'
+
+function callLang () {
+  if (call.lang) return call.lang
+  return String((call.settings && call.settings.language) || 'he').startsWith('en') ? 'en' : 'he'
+}
+
+// The few lines the plugin says itself (never content: content always comes from Hermes).
+export function localLine (kind) {
+  const he = callLang() === 'he'
+  const female = !!(call.settings && call.settings.persona_gender === 'female')
+  switch (kind) {
+    case 'ack': return he ? (female ? 'בודקת.' : 'בודק.') : 'Checking.'
+    case 'greeting': return he ? 'היי, אני כאן.' : "Hi, I'm here."
+    case 'bye': return he ? 'ביי.' : 'Bye.'
+    case 'switch': return he ? (female ? 'החלפתי ספק קול, ממשיכה.' : 'החלפתי ספק קול, ממשיך.') : 'I switched voice provider; carrying on.'
+    case 'rest': return he ? 'ההמשך בצ\'אט.' : 'The rest is in the chat.'
+    default: return ''
+  }
+}
+
+function personaNames () {
+  const s = call.settings || {}
+  return [s.persona_name, s.persona_name_he, 'hermes', 'הרמס']
+}
+
+// Queue words for the voice to read verbatim. kind: ack | local | reply.
+function enqueueSay (text, group, extra = {}) {
+  const t = norm(text)
+  if (!t || call.dropped.has(group)) return
+  const item = { text: t, group, say: true, kind: 'reply', ...extra }
+  if (call.held && call.held.group === group) { call.held.items.push(item); return }
+  if (item.kind !== 'ack') dropPendingAck()
+  call.queue.push(item)
+  flushResults()
+}
+
+function dropPendingAck () {
+  if (call.ackTimer) { E().clearTimeout(call.ackTimer); call.ackTimer = null }
+  if (call.queue.some(i => i.kind === 'ack')) call.queue = call.queue.filter(i => i.kind !== 'ack')
+}
+
+function sayLocal (kind, extra = {}) {
+  call.group += 1
+  enqueueSay(localLine(kind), call.group, { kind: kind === 'ack' ? 'ack' : 'local', ...extra })
+}
+
+// A whole reply at once (repeat, an error, a reply that did not stream): cut like a stream.
+export function sayReply (text) {
+  if (isSilent(text)) return 0
+  call.group += 1
+  const g = call.group
+  let total = 0
+  let n = 0
+  for (const p of cutPieces(sayText(text), true).pieces) {
+    if (isMarker(p)) continue
+    if (total > MAX_REPLY_CHARS) { enqueueSay(localLine('rest'), g); break }
+    total += p.length
+    n += 1
+    enqueueSay(p, g)
+  }
+  return n
+}
+
+// ── the streamed reply (message.start / message.delta / message.interim / message.complete)
+function newStream () {
+  call.group += 1
+  call.stream = { group: call.group, raw: '', spoken: '', said: new Set(), chars: 0, silent: false, capped: false, active: true, createdAt: E().now(), text: [] }
+  return call.stream
+}
+
+const couldBeMarker = raw => {
+  const t = raw.trim().toUpperCase()
+  return !t || SILENT_MARKERS.some(m => m.toUpperCase().startsWith(t))
+}
+
+function emitPiece (s, p) {
+  s.spoken = s.spoken ? `${s.spoken} ${p}` : p
+  if (isMarker(p) || s.capped) return
+  if (s.said.has(norm(p))) return // already read in an earlier segment of this reply
+  if (s.chars > MAX_REPLY_CHARS) { s.capped = true; enqueueSay(localLine('rest'), s.group); return }
+  s.chars += p.length
+  s.said.add(norm(p))
+  s.text.push(p)
+  latText(s)
+  enqueueSay(p, s.group)
+}
+
+// Speak every complete sentence of the current segment that is not spoken yet.
+function pump (s, final) {
+  if (!s || s.silent) return
+  if (isSilent(s.raw)) { s.silent = !s.chars; return }
+  if (!final && !s.spoken && couldBeMarker(s.raw)) return // "NO" may still become "NO_REPLY"
+  // sayText trims; a trailing space in the raw stream is what confirms the last sentence ended.
+  const text = sayText(s.raw) + (/\s$/.test(s.raw) ? ' ' : '')
+  const { pieces } = cutPieces(text, final)
+  for (const p of freshPieces(pieces, s.spoken)) emitPiece(s, p)
+}
+
+// A segment ends (interim seal, a null delta, a tool call): speak its tail, start the next one.
+function closeSegment (s) {
+  pump(s, true)
+  s.raw = ''
+  s.spoken = ''
+}
+
+const liveStream = () => (call.stream && call.stream.active ? call.stream : newStream())
+
+function relayStart () {
+  if (call.stream && call.stream.active) finishStream(call.stream)
+  newStream()
+}
+
+function relayDelta (text) {
+  const s = liveStream()
+  if (text === null) { closeSegment(s); return } // segment boundary (before tool lines)
+  if (typeof text !== 'string' || !text) return
+  s.raw += text
+  pump(s, false)
+}
+
+function relayInterim (payload) {
+  const s = liveStream()
+  const text = textOf(payload.text)
+  if (!payload.already_streamed && text.trim()) {
+    if (s.raw.trim()) closeSegment(s)
+    s.raw = text
+  }
+  closeSegment(s)
+}
+
+// Full-readout guarantee: the final text is cut the same way; any sentence not read yet is read
+// (an exact sentence already read in this reply is not read twice). An empty final keeps the
+// streamed text (Hermes core's contract for a held silence marker).
+function relayComplete (payload) {
+  const s = liveStream()
+  const owed = call.delegations > 0
+  if (owed) call.delegations -= 1
+  const final = textOf(payload.text).trim()
+  if (final && !isSilent(final)) {
+    pump(s, false) // complete sentences only: the unfinished tail is covered by the final text
+    for (const p of cutPieces(sayText(final), true).pieces) {
+      if (!s.said.has(norm(p))) emitPiece(s, p)
+    }
+  } else if (!final) {
+    pump(s, true)
+  } else if (!s.chars) {
+    s.silent = true
+  }
+  finishStream(s)
+  if (!s.chars && !s.silent && owed) {
+    sayReply(payload.status === 'error' || payload.error
+      ? `Hermes stopped with an error: ${textOf(payload.error || payload.failure_reason || 'unknown').slice(0, 300)}`
+      : 'Hermes finished without a text answer.')
+  }
+}
+
+function finishStream (s) {
+  s.active = false
+  if (call.stream === s) call.stream = null
+  if (s.chars) {
+    call.lastReply = s.text.join(' ')
+    call.awaitingAnswer = /[?？]["'”’)]*$/.test(call.lastReply)
+  }
+  if (call.lat && call.lat.group === s.group && !s.chars) latFlush('turn') // a silent reply
+}
+
+// ── the user's turn: the renderer decides
+export function onUserTurn (text, eos) {
+  const t = norm(text)
+  const c = classifyTurn(t, { names: personaNames(), awaiting: call.awaitingAnswer })
+  if (c.lang) call.lang = c.lang
+  call.lastTurn = c
+  resolveHold(c.kind)
+  if (c.kind === 'empty' || c.kind === 'ack' || c.kind === 'short') { publish(); return c }
+  call.awaitingAnswer = false
+  if (c.kind === 'greeting') sayLocal('greeting')
+  else if (c.kind === 'stop') stopSpeaking()
+  else if (c.kind === 'bye') { stopSpeaking(); sayLocal('bye', { bye: true }) } else if (c.kind === 'repeat' && call.lastReply) { stopSpeaking(); sayReply(call.lastReply) } else delegateTurn(t, eos)
+  publish()
+  return c
+}
+
+function delegateTurn (text, eos) {
+  latStart(eos)
+  armAck()
+  void delegate(text)
+}
+
+function armAck () {
+  if (call.ackTimer) E().clearTimeout(call.ackTimer)
+  const lat = call.lat
+  call.ackTimer = E().setTimeout(() => {
+    call.ackTimer = null
+    if (call.state === 'idle' || (lat && lat.firstText) || call.lat !== lat) return
+    sayLocal('ack')
+  }, ACK_DELAY_MS)
+}
+
+// "stop", "bye", "repeat": nothing queued or playing is read any further.
+function stopSpeaking () {
+  const groups = new Set(call.queue.filter(i => i.say).map(i => i.group))
+  if (call.held) { groups.add(call.held.group); call.held = null }
+  if (call.holdTimer) { E().clearTimeout(call.holdTimer); call.holdTimer = null }
+  if (call.speakingGroup) groups.add(call.speakingGroup)
+  if (call.stream && call.stream.active) groups.add(call.stream.group)
+  groups.forEach(g => call.dropped.add(g))
+  call.queue = call.queue.filter(i => !i.say)
+  if (call.handing || call.modelSpeaking || T().playing()) T().stopPlayback()
+  Object.assign(call, { modelSpeaking: false, handing: false, pendingHand: 0, lastHanded: null, speakingGroup: 0 })
+  dropPendingAck()
+}
+
+// Barge-in on a reply: what is still queued of it is held back until the user's words are known.
+// A backchannel ("ok", "כן") or noise resumes it (the interrupted sentence is read again); anything
+// else drops it: the user moved on, and the new turn goes to Hermes as a follow-up or correction.
+function holdForBargeIn () {
+  const g = call.speakingGroup
+  if (g && !call.held && !call.dropped.has(g)) {
+    const items = []
+    const last = call.lastHanded
+    if (last && last.group === g && last.kind === 'reply') items.push(last)
+    for (const i of call.queue) if (i.group === g && i.kind === 'reply') items.push(i)
+    call.queue = call.queue.filter(i => i.group !== g)
+    call.held = { group: g, items }
+    if (call.holdTimer) E().clearTimeout(call.holdTimer)
+    const tick = () => {
+      call.holdTimer = null
+      if (!call.held || call.held.group !== g) return
+      if (call.userPending) { call.holdTimer = E().setTimeout(tick, HOLD_MS); return }
+      resolveHold('empty')
+    }
+    call.holdTimer = E().setTimeout(tick, HOLD_MS)
+  }
+  call.queue = call.queue.filter(i => i.kind !== 'ack') // a stale "checking" is not said after an interruption
+  Object.assign(call, { pendingHand: 0, lastHanded: null, speakingGroup: 0 })
+}
+
+function resolveHold (kind) {
+  const h = call.held
+  if (!h) return
+  call.held = null
+  if (call.holdTimer) { E().clearTimeout(call.holdTimer); call.holdTimer = null }
+  if (kind === 'empty' || kind === 'ack' || kind === 'short') {
+    call.queue.unshift(...h.items)
+    flushResults()
+  } else {
+    call.dropped.add(h.group)
+  }
+}
+
+// ── gemini end-of-turn (no create_response switch there): the first output of the voice's own turn,
+// or its empty turnComplete, is the server VAD saying the user's turn is over.
+function relayHeard (text, now) {
+  call.lastHeardAt = now
+  call.userPending = true
+  // our handed text is answered after the user, not before: hand it again later
+  if (call.pendingHand > 0 && call.owner !== 'hermes') {
+    call.pendingHand = 0
+    call.handing = false
+    if (call.lastHanded && call.lastHanded.kind === 'reply') call.queue.unshift(call.lastHanded)
+    call.lastHanded = null
+  }
+  flushPartial('assistant')
+  call.partial.user += text
+  if (call.fallbackTimer) E().clearTimeout(call.fallbackTimer)
+  const wait = ((call.settings && call.settings.silence_ms) || 1000) + FINAL_FALLBACK_MS
+  call.fallbackTimer = E().setTimeout(() => { call.fallbackTimer = null; finalizeUser() }, wait)
+}
+
+function userTurnEnded (now) {
+  if (!call.userPending) return
+  if (!call.eosAt) call.eosAt = now
+  if (!call.finalTimer) call.finalTimer = E().setTimeout(() => { call.finalTimer = null; finalizeUser() }, FINAL_LAG_MS)
+}
+
+export function finalizeUser () {
+  if (call.finalTimer) { E().clearTimeout(call.finalTimer); call.finalTimer = null }
+  if (call.fallbackTimer) { E().clearTimeout(call.fallbackTimer); call.fallbackTimer = null }
+  if (!call.userPending) return
+  call.userPending = false
+  const text = norm(call.partial.user)
+  flushPartial('user')
+  const eos = call.eosAt || call.lastHeardAt || E().now()
+  call.eosAt = 0
+  onUserTurn(text, eos)
+  flushResults()
+}
+
+// ── latency: one line per delegated turn, numbers only (no content)
+function latStart (eos) {
+  latFlush('abandoned')
+  call.lat = { eos, submit: E().now(), firstText: 0, firstAudio: 0, firstAnswerAudio: 0, group: 0, ack: false }
+}
+
+function latText (s) {
+  const l = call.lat
+  if (l && !l.firstText && s.createdAt >= l.submit) { l.firstText = E().now(); l.group = s.group }
+}
+
+// The first audio of a handed item started playing.
+function noteAudio () {
+  const l = call.lat
+  const item = call.lastHanded
+  if (!l || !item) return
+  const now = E().now()
+  if (item.kind === 'ack') { l.ack = true; if (!l.firstAudio) l.firstAudio = now; return }
+  if (l.group && item.group === l.group) {
+    if (!l.firstAudio) l.firstAudio = now
+    if (!l.firstAnswerAudio) { l.firstAnswerAudio = now; latFlush('turn') }
+  }
+}
+
+function latFlush (kind) {
+  const l = call.lat
+  if (!l) return
+  call.lat = null
+  const rel = t => (t ? Math.max(0, Math.round(t - l.eos)) : null)
+  const rec = {
+    provider: (call.provider && call.provider.id) || 'unknown',
+    brain: call.brain || 'unknown',
+    kind,
+    silence_ms: (call.settings && call.settings.silence_ms) || null,
+    ack: l.ack,
+    submit: rel(l.submit),
+    first_text: rel(l.firstText),
+    first_audio: rel(l.firstAudio),
+    first_answer_audio: rel(l.firstAnswerAudio)
+  }
+  E().log('[gemini-live-chat] latency', JSON.stringify(rec))
+  const ctx = call.ctx
+  if (ctx) try { void Promise.resolve(ctx.rest('/latency', { method: 'POST', body: rec })).catch(() => {}) } catch { /* best effort */ }
 }
 
 // ── gemini-live transport ────────────────────────────────────────────────────────────────────────
@@ -694,6 +1309,7 @@ export function receive (msg, ws) {
     return
   }
   if (ws !== call.ws) return // frames from a socket being replaced
+  if (isHermes()) { receiveRelay(msg); return }
   const content = msg.serverContent
   if (content) {
     if (content.interrupted) onBargeIn() // the server's VAD already stopped generation
@@ -730,6 +1346,11 @@ export function receive (msg, ws) {
     flushResults()
   }
   if (msg.toolCall) onToolCall(msg.toolCall.functionCalls)
+  receiveSession(msg)
+}
+
+// Resumption, goAway and errors: the same in both brains.
+function receiveSession (msg) {
   if (msg.sessionResumptionUpdate && msg.sessionResumptionUpdate.resumable && msg.sessionResumptionUpdate.newHandle) {
     call.resumeHandle = String(msg.sessionResumptionUpdate.newHandle)
   }
@@ -741,6 +1362,59 @@ export function receive (msg, ws) {
     call.detail = text
     publish()
   }
+}
+
+// brain: hermes on Gemini Live. Gemini has no "don't respond" switch, so every model turn is
+// classified when its first output arrives: a turn that follows our handed text (pendingHand) is
+// Hermes' words and is played; any other turn is the voice model's own and is neither played nor
+// recorded; its first output (or its empty turnComplete) only marks the end of the user's turn.
+function receiveRelay (msg) {
+  const now = E().now()
+  const content = msg.serverContent
+  const heard = transcriptOf(msg, content, 'inputTranscription')
+  if (heard) {
+    // speech heard while buffered audio still plays gets no "interrupted" from the server
+    if (call.owner !== 'hermes' && call.player && call.player.playing()) onBargeIn()
+    relayHeard(heard, now)
+  }
+  if (content) {
+    const parts = (content.modelTurn && content.modelTurn.parts) || []
+    const audio = parts.filter(p => p.inlineData && p.inlineData.data)
+    const said = transcriptOf(msg, content, 'outputTranscription')
+    if (content.interrupted) {
+      if (call.owner === 'hermes' || (call.player && call.player.playing())) onBargeIn()
+      call.owner = null
+    }
+    if ((audio.length || said) && !call.owner) {
+      if (call.pendingHand > 0) { call.pendingHand -= 1; call.owner = 'hermes' } else call.owner = 'voice'
+    }
+    if (call.owner === 'voice' || (!call.owner && content.turnComplete)) userTurnEnded(now)
+    if (call.owner === 'hermes') {
+      for (const part of audio) {
+        if (!call.modelSpeaking) noteAudio()
+        call.modelSpeaking = true
+        call.lastAudioAt = now
+        call.player && call.player.play(b64ToPcm(part.inlineData.data))
+      }
+      if (said) { if (!call.userPending) flushPartial('user'); call.partial.assistant += said }
+    }
+    if (content.turnComplete) {
+      const was = call.owner
+      call.owner = null
+      if (was === 'hermes' || was === 'muted') {
+        flushPartial('assistant')
+        call.modelSpeaking = false
+        call.handing = false
+        if (call.hangUp) { tearDown(''); return }
+      }
+      flushResults()
+    }
+  }
+  if (msg.toolCall) { // no tools are declared in this mode; answer anything stray so the turn goes on
+    const calls = msg.toolCall.functionCalls || []
+    if (calls.length) T().answerTools(calls.map(fc => ({ id: String(fc.id || ''), name: String(fc.name || ''), response: { error: 'not available' } })))
+  }
+  receiveSession(msg)
 }
 
 function decode (data) {
@@ -884,11 +1558,74 @@ async function openRealtime (minted, gen) {
   }
 }
 
+// brain: hermes on OpenAI Realtime (create_response: false): the server detects and transcribes the
+// user's turn but never answers it; the only responses are the out-of-band readings created in
+// handText. Returns true when the event is fully handled here; the rest (audio buffer state,
+// errors) is shared with voice mode.
+function receiveRealtimeRelay (msg, rtc, now) {
+  switch (msg.type) {
+    case 'input_audio_buffer.speech_started': // barge-in: interrupt_response already cut the reading
+      call.lastHeardAt = now
+      call.userPending = true
+      call.eosAt = 0
+      if (call.modelSpeaking || call.handing || rtc.responding || rtc.speaking) onBargeIn()
+      else flushPartial('assistant')
+      return true
+    case 'input_audio_buffer.speech_stopped':
+      call.eosAt = now
+      return true
+    case 'conversation.item.input_audio_transcription.delta':
+      if (msg.delta) { call.lastHeardAt = now; flushPartial('assistant'); call.partial.user += msg.delta }
+      return true
+    case 'conversation.item.input_audio_transcription.completed': {
+      flushPartial('assistant')
+      if (typeof msg.transcript === 'string' && msg.transcript.trim()) call.partial.user = msg.transcript
+      const text = norm(call.partial.user)
+      flushPartial('user')
+      call.userPending = false
+      const eos = call.eosAt || now
+      call.eosAt = 0
+      onUserTurn(text, eos)
+      flushResults()
+      return true
+    }
+    case 'conversation.item.input_audio_transcription.failed':
+      call.partial.user = ''
+      call.userPending = false
+      resolveHold('empty')
+      flushResults()
+      return true
+    case 'response.created':
+      rtc.responding = true
+      rtc.responseId = (msg.response && msg.response.id) || null
+      return true
+    case 'response.output_audio_transcript.delta':
+      if (msg.delta) { if (!call.userPending) flushPartial('user'); call.partial.assistant += msg.delta }
+      return true
+    case 'output_audio_buffer.started':
+      if (!call.modelSpeaking) noteAudio()
+      return false
+    case 'response.function_call_arguments.done': // no tools in this mode
+      return true
+    case 'response.done':
+      flushPartial('assistant')
+      rtc.responding = false
+      rtc.responseId = null
+      rtc.needResponse = false
+      call.handing = false
+      if (call.hangUp) { if (!rtc.speaking) tearDown(''); return true }
+      flushResults()
+      return true
+  }
+  return false
+}
+
 // OpenAI Realtime server events (GA names), mapped onto the shared call logic.
 export function receiveRealtime (msg) {
   const rtc = call.rtc
   if (!msg || typeof msg !== 'object' || !rtc) return
   const now = E().now()
+  if (isHermes() && receiveRealtimeRelay(msg, rtc, now)) return
   switch (msg.type) {
     case 'input_audio_buffer.speech_started': // barge-in: the server already cut its response
       call.lastHeardAt = now
@@ -968,6 +1705,7 @@ function openTransport (minted, gen) {
     transport: minted.transport || 'gemini-live',
     model: minted.model || ''
   }
+  call.brain = BRAINS.includes(minted.brain) ? minted.brain : 'voice' // an older backend: v0.5 behaviour
   if (call.providersUsed.at(-1) !== call.provider.label) call.providersUsed.push(call.provider.label)
   publish()
   if (call.provider.transport === 'openai-realtime') {
@@ -1030,6 +1768,7 @@ export async function failover (reason, note) {
   if (call.hangUp || call.switches >= MAX_SWITCHES || !call.ctx) { tearDown(note); return }
   call.gen += 1
   const gen = call.gen
+  if (isHermes() && call.userPending) finalizeUser() // the words heard so far still go to Hermes
   if (call.handing && call.lastHanded) call.queue.unshift(call.lastHanded) // never answered: hand it again
   releaseTransport()
   Object.assign(call, { state: 'connecting', switching: true, handing: false, switches: call.switches + 1, detail: 'Switching voice provider…' })
@@ -1306,8 +2045,21 @@ function StatusChip () {
 // v0.4: a reply that lands during a provider switch is queued and spoken by the next provider.
 const onPinnedChat = event => !!(event && call.state !== 'idle' && call.sessionId && event.session_id === call.sessionId)
 
+export function onMessageStart (event) {
+  if (!onPinnedChat(event) || !isHermes()) return
+  relayStart()
+}
+
+// brain: hermes: Hermes' reply is read while it streams, sentence by sentence.
+export function onMessageDelta (event) {
+  if (!onPinnedChat(event) || !isHermes()) return
+  const payload = event.payload || {}
+  relayDelta(payload.text === null ? null : payload.text)
+}
+
 export function onMessageInterim (event) {
   if (!onPinnedChat(event)) return
+  if (isHermes()) { relayInterim(event.payload || {}); return }
   const text = textOf((event.payload || {}).text).replace(/\s+/g, ' ').trim()
   if (text) call.interim.push(text)
 }
@@ -1315,6 +2067,7 @@ export function onMessageInterim (event) {
 export function onMessageComplete (event) {
   if (!onPinnedChat(event)) return
   const payload = event.payload || {}
+  if (isHermes()) { relayComplete(payload); publish(); return }
   const final = textOf(payload.text).trim()
   const interim = call.interim
   call.interim = []
@@ -1341,6 +2094,8 @@ export default {
   register (ctx) {
     ctx.onEvent('message.complete', onMessageComplete)
     ctx.onEvent('message.interim', onMessageInterim)
+    ctx.onEvent('message.start', onMessageStart) // v0.6 brain: hermes streaming
+    ctx.onEvent('message.delta', onMessageDelta)
     // Disable / unload / hot-reload: hang up and release everything (mic, sockets, peer, audio).
     ctx.onDispose(() => tearDown())
     ctx.register({ id: 'talk', area: 'composer.actions', order: 42, render: () => h(VoiceButton, { ctx }) })
