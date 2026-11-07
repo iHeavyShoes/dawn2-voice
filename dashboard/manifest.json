@@ -1,9 +1,9 @@
 {
   "name": "gemini-live-chat",
-  "label": "Gemini Live",
-  "description": "Single-use Gemini Live tokens for the Desktop voice call (the key stays on the server).",
+  "label": "Live voice",
+  "description": "Short-lived voice sessions for the Desktop call on a provider chain (Gemini free, ChatGPT/Codex, Gemini paid); no credential reaches the renderer.",
   "icon": "MessageSquare",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "tab": { "path": "/gemini-live-chat", "hidden": true },
   "api": "plugin_api.py"
 }

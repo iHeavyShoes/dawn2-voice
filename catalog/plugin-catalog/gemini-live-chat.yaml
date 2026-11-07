@@ -13,17 +13,23 @@ description: >-
   with markdown, code and URLs removed; [SILENT] replies are not spoken. Barge-in,
   live language switching (starts in the configured language, follows the speaker), the spoken
   transcript saved to the chat at hang-up, and one idempotent stop path that closes both sockets,
-  every mic track and both AudioContexts. The key never reaches the renderer: the backend mints a
-  single-use, setup-locked ephemeral token. Disclosure — pressing the call button captures
-  microphone audio and streams it from the renderer to generativelanguage.googleapis.com; the
-  backend calls the same host to mint the token with GEMINI_API_KEY (read through Hermes' secret
-  scope). Delegated requests, Hermes' answers (as text) and the recent spoken turns are sent to
-  Gemini. The profile's SOUL.md is read only for the agent's name, which is the only part sent.
-  Call transcripts are written to the plugin's Desktop data folder and, by default, as one
-  queued turn in the open chat. No shell commands, background processes or telemetry.
+  every mic track and both AudioContexts. Provider chain with automatic fallback, also mid-call
+  (the next provider gets the recent spoken turns): Gemini Live on GEMINI_API_KEY, then OpenAI
+  Realtime on the user's ChatGPT/Codex sign-in in Hermes, then Gemini Live on the optional
+  GEMINI_API_KEY_PAID. No credential reaches the renderer: the backend mints a single-use,
+  setup-locked Gemini token, or asks Hermes core to sign one OpenAI client-secret request
+  (requires_auth: openai-codex; the plugin never sees the Codex token). Disclosure — pressing the
+  call button captures microphone audio and streams it from the renderer to the serving provider:
+  generativelanguage.googleapis.com (Gemini) or api.openai.com (OpenAI Realtime, WebRTC). The
+  backend calls the same hosts to mint sessions. Delegated requests, Hermes' answers (as text) and
+  the recent spoken turns are sent to the serving provider; after a provider switch, the recent
+  spoken turns are also sent to the next one. The profile's SOUL.md is read only for the agent's
+  name, which is the only part sent. Call transcripts are written to the plugin's Desktop data
+  folder and, by default, as one queued turn in the open chat. No shell commands, background
+  processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.3.1"
+version: "0.4.0"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"
@@ -34,3 +40,5 @@ capabilities:
   provides_middleware: []
   requires_env:
   - GEMINI_API_KEY
+  requires_auth:
+  - openai-codex

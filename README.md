@@ -1,6 +1,9 @@
-# Gemini Live for Hermes Desktop (`gemini-live-chat`)
+# Live voice for Hermes Desktop (`gemini-live-chat`)
 
-Talk to Hermes out loud, full duplex, with Google **Gemini Live** as the voice layer. Every real
+Talk to Hermes out loud, full duplex. The voice layer is a **provider chain** with automatic
+fallback, also mid-call: Google **Gemini Live** on a free key, then **OpenAI Realtime** on your
+ChatGPT/Codex sign-in, then Gemini Live on a paid key (see
+[Voice providers and fallback](#voice-providers-and-fallback-design)). Every real
 request is handed to Hermes as a normal turn **in the chat you have open**, so nothing said on the
 call is lost.
 
@@ -22,20 +25,26 @@ call is lost.
   the chat and to tell you or handle it; if nothing was missed it replies with one short line.
 - **Hebrew first, switch any time.** The voice starts in Hebrew (configurable) and answers in
   whichever language you spoke last.
-- **Barge-in.** Talk over the voice and it stops at once (Gemini's server VAD plus a local flush of
+- **Barge-in.** Talk over the voice and it stops at once (the provider's server VAD plus a local flush of
   every queued audio buffer, also when the model has finished generating but audio is still
   playing). Interrupting a long answer drops its remaining parts; they stay in the chat.
 - **Clean stop.** Hang-up, `end_call`, a dropped socket, disabling or hot-reloading the plugin all
-  run one idempotent teardown that closes both sockets, stops every microphone track, closes both
-  AudioContexts and clears timers. The backend holds no socket and starts no process, so there is
+  run one idempotent teardown that closes the sockets or the peer connection, stops every
+  microphone track, closes the AudioContexts and remote audio, and clears timers. The backend holds no socket and starts no process, so there is
   nothing to orphan or kill.
-- **Key stays on the server.** The renderer gets a single-use ephemeral token (60 s to connect,
-  30 min lifetime) whose whole session setup (model, persona, tools, voice) is locked by Google.
+- **No credential in the renderer.** For Gemini it gets a single-use ephemeral token (60 s to
+  connect, 30 min lifetime) whose whole session setup (model, persona, tools, voice) is locked by
+  Google; for OpenAI a short-lived client secret that Hermes core signed for with your Codex
+  sign-in.
+- **Same behaviour on every provider.** Delegation, ack-only, full readout, barge-in, transcript
+  and stop are shared code above a small transport layer, and the tests run them on each provider.
 
 ## Requirements
 
 - Hermes Agent **0.21.5 or newer** with Hermes Desktop (Windows, macOS or Linux).
-- A Google AI Studio API key with access to the Gemini Live API.
+- At least one provider: a Google AI Studio key with Gemini Live access (`GEMINI_API_KEY`), a
+  ChatGPT/Codex sign-in in Hermes (Providers → OpenAI Codex), or a billed key
+  (`GEMINI_API_KEY_PAID`).
 - A microphone. Headphones are recommended; on loudspeakers see `half_duplex`.
 
 ## Install
@@ -43,7 +52,9 @@ call is lost.
 1. Copy this folder (or `git clone` the repository) to `%LOCALAPPDATA%\hermes\plugins\gemini-live-chat` (folder name must match).
 2. Add `GEMINI_API_KEY` (a Google AI Studio key, https://aistudio.google.com/apikey) to the Hermes
    profile's `.env`. The plugin reads it only through `agent.secret_scope.get_secret`; it never
-   reads `.env` itself, and never logs, returns or stores the key.
+   reads `.env` itself, and never logs, returns or stores the key. Optional: a billed key as
+   `GEMINI_API_KEY_PAID` (the last fallback), read the same way; absent, it is skipped.
+   For the ChatGPT/Codex voice, sign in to OpenAI Codex in Hermes; nothing else to configure.
 3. Enable the Python half (it serves the token route): `hermes plugins enable gemini-live-chat`.
 4. In Desktop: **Capabilities → Plugins → Rescan**, then switch **Gemini Live** on (the desktop
    half ships off by default).
@@ -55,6 +66,9 @@ Without the key the button is disabled and its tooltip says exactly what to add.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `providers` | `gemini-free,openai-codex,gemini-paid` | The fallback chain, in order. Drop an id to never use it. |
+| `openai_model` | `gpt-realtime-2.1` | OpenAI Realtime model for `openai-codex` (`gpt-realtime*`). |
+| `openai_voice` | `auto` | `auto`: `cedar` (male) or `marin` (female) by the persona. Or `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`. |
 | `model` | `gemini-3.8-live` | Live model. `gemini-3.8-live` delegates reliably; `-extended-thinking` decides to answer itself about 3 times in 5 (measured by hermes-gemini-live). |
 | `voice` | `auto` | `auto`: `Charon` (male) or `Aoede` (female) by the persona's gender. Or any Gemini prebuilt voice: male `Charon`, `Puck`, `Fenrir`, `Orus`, `Iapetus`, ...; female `Aoede`, `Kore`, `Leda`, `Zephyr`, ... Unknown names fall back to `auto`. |
 | `persona_name` | empty | Who the voice is. Empty: the agent name from this profile's `SOUL.md` (`You are Ray (in Hebrew exactly ריי)` gives `Ray`/`ריי`), else `Hermes`. |
@@ -150,6 +164,81 @@ What is sent to Google during a call: your microphone audio, the delegated reque
 answers (as text, so the voice can summarise them) and the last few spoken turns. Your chat history
 and files are not sent; Hermes itself still runs on whatever provider your chat uses.
 
+## Voice providers and fallback (design)
+
+One call, one conversation, several possible voices. The chain is an ordered list of providers;
+the first that can serve takes the call, and a provider that fails hands the **same** call to the
+next one.
+
+| Id | Voice | Credential | Transport |
+|---|---|---|---|
+| `gemini-free` | Gemini Live | `GEMINI_API_KEY` (free tier) | WebSocket, single-use setup-locked token |
+| `openai-codex` | OpenAI Realtime (GPT voice) | your ChatGPT/Codex sign-in in Hermes | WebRTC, short-lived client secret |
+| `gemini-paid` | Gemini Live | `GEMINI_API_KEY_PAID` (billed) | WebSocket, single-use setup-locked token |
+
+Default order `gemini-free,openai-codex,gemini-paid` (setting `providers`). A provider with no
+credential (`no_key`, `not_signed_in`, `unsupported`) is skipped without a network call.
+
+**Provider abstraction.** The backend (`gemini_live_chat/providers.py`) only *mints* sessions:
+`gemini_live_chat/live.py` for Gemini, `gemini_live_chat/openai_rt.py` for OpenAI. Both are built
+from the same persona (`persona.py`; only the sentence naming the engine differs, the Gemini text
+is byte-identical to v0.3) and the same two tools, `hermes_task` and `end_call`. In the renderer
+everything above the wire is shared: delegation (`prompt.submit`, surface `voice-live`,
+`voice_context`), the ack-only receipt, chunked readout of Hermes' replies, barge-in bookkeeping,
+the transcript and the stop path. A transport (`TRANSPORTS` in `desktop/plugin.js`) only moves
+text, tool answers and audio on its wire: `gemini-live` (`realtimeInput` / `toolResponse` on the
+socket, PCM through an AudioWorklet) and `openai-realtime` (`conversation.item.create` +
+`response.create` on the `oai-events` data channel, audio on the peer connection).
+
+**The Codex route.** Hermes core already has a supported path, so the plugin uses it instead of
+spawning `codex app-server`: `plugin.yaml` declares `requires_auth: [openai-codex]`, and the backend
+asks `hermes_cli.plugin_provider_requests.credentialed_provider_request("openai-codex", "POST",
+"https://api.openai.com/v1/realtime/client_secrets", ...)` for one ephemeral client secret per call.
+Core attaches the Codex token server-side and refreshes it; the plugin never sees it, never reads
+`~/.codex/auth.json`, and starts no child process, so there is nothing to hang, orphan or keep a
+stale token in (the three failures of the app-server approach). The renderer uses the secret once,
+as the bearer of its SDP offer to `https://api.openai.com/v1/realtime/calls`; it accepts no other
+origin. A refusal is respected as such: a quota or auth error moves the call on, it is never
+retried around.
+
+**Failure handling.**
+
+- *At connect* (`POST /session`): each provider in order is minted; `quota` (429, exhausted),
+  `auth` (401/403, bad key) and `unavailable` (5xx, network) move to the next. The answer names the
+  serving provider and lists the skipped ones with their reasons. All unconfigured: 503 `no_key`.
+  All refused: 502 `exhausted`, with one line per provider.
+- *Mid-call*: a Gemini socket closing with a non-1000 code, a Live `error`, an OpenAI `error` event
+  for quota/auth/expiry, a refused SDP exchange or a failed peer connection triggers `failover`.
+  It releases the failed transport completely (socket or peer connection, microphone tracks,
+  AudioContexts, remote audio), keeps the conversation (turns, queued replies, open delegations,
+  pinned chat), and asks for the next provider with `exclude` = every provider that failed on this
+  call and `carry` = the recent spoken turns, which go into the new voice's instructions. The new
+  voice first says it switched ("switching voice provider", in your language), then continues; a
+  reply part handed over but never answered is handed again, and a Hermes reply that arrived
+  during the switch is read by the new voice. Delegations are never re-submitted.
+- *Bounds*: at most 3 switches per call; a provider that failed on a call is not retried on it;
+  one that refused for quota or auth is skipped for 15 minutes on the next calls, unless nothing
+  else can serve. `end_call` and a normal close (1000) end the call, never switch. A resumption
+  handle (Gemini `goAway`) is honoured only on the provider that issued it.
+- *Log*: one line per served session, ids and reasons only, for example
+  `gemini-live-chat: voice provider openai-codex serving (connect; model=gpt-realtime-2.1; skipped
+  gemini-free:quota)` or `... (switched from gemini-free after network)`. No key, token, secret or
+  vendor error body is logged or returned. The transcript names the provider(s) that served.
+- *UI*: the status-bar chip and the button tooltip name the serving provider
+  (`Gemini (free key): on call`, `ChatGPT (Codex subscription): Hermes working (1)`), and show
+  `Voice: switching provider` during a switch.
+
+**Catalog exception (documented).** The OpenAI route sends audio to `api.openai.com` on your
+ChatGPT subscription through a core-signed request; it needs `requires_auth`, and its realtime
+allowance is OpenAI's to set. That is outside the catalog's single-provider shape, which is fine
+for a personal plugin and is disclosed below.
+
+**Name.** The plugin is no longer Gemini-only. Proposed rename: `live-voice-chat` (folder, plugin
+id, repo). It is not done here: the plugin id is the folder name, the settings key
+(`plugins.entries.gemini-live-chat`) and the Desktop data folder, so a rename moves settings and
+transcripts and needs one coordinated step (rename the GitHub repo, move the folder, copy the
+settings block).
+
 ## How it works
 
 ```
@@ -167,6 +256,12 @@ Desktop renderer (desktop/plugin.js)                 Hermes backend (dashboard/p
   hang-up ─▶ tearDown(): sockets, mic tracks, AudioContexts, timers; transcript saved once
 ```
 
+On `openai-codex` the backend asks core to sign `POST /v1/realtime/client_secrets` and returns
+`{ client_secret, offer_url, model }`; the renderer opens an `RTCPeerConnection` with the mic track
+and an `oai-events` data channel, posts its SDP offer to `offer_url`, and maps the Realtime events
+(`response.function_call_arguments.done`, `input_audio_buffer.speech_started`,
+`output_audio_buffer.*`, transcripts, `error`) onto the same call logic.
+
 Surfaces used: `composer.actions` and `statusBar.right` slots, `ctx.rest`, `ctx.onEvent`,
 `ctx.onDispose`, `ctx.files` (own data folder), `host.request('prompt.submit')`, `host.notify`.
 No DOM access, no `window.hermesDesktop`, no dynamic import, no core patches.
@@ -181,11 +276,15 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 
 ## Disclosure
 
-- Network: the backend calls `generativelanguage.googleapis.com` (token creation); the renderer
-  opens a WebSocket to the same host. Audio goes to Google; nothing else leaves the machine.
-- Reads: `GEMINI_API_KEY` through Hermes' secret scope, this plugin's own settings, and the first
+- Network: Gemini: the backend calls `generativelanguage.googleapis.com` (token creation) and the
+  renderer opens a WebSocket to the same host. OpenAI: Hermes core calls
+  `api.openai.com/v1/realtime/client_secrets` for the plugin (`requires_auth: openai-codex`) and
+  the renderer opens WebRTC to `api.openai.com`. Audio goes to the serving provider; after a
+  switch the recent spoken turns also go to the next one. Nothing else leaves the machine.
+- Reads: `GEMINI_API_KEY` and `GEMINI_API_KEY_PAID` through Hermes' secret scope, this plugin's own settings, and the first
   16 KB of the profile's `SOUL.md` to take the agent's **name** (and an explicitly stated gender).
-  Only the name is sent to Google; the SOUL text is not.
+  Only the name is sent to the voice provider; the SOUL text is not. The Codex token is never
+  read by the plugin (Hermes core signs the one request).
 - Writes: call transcripts in the plugin's Desktop data folder (`ctx.files`, `data`), and one
   queued turn per call in the open chat (unless `transcript_to_chat` says otherwise).
 - No shell commands, no background processes, no telemetry, no self-update.
@@ -215,13 +314,14 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
-python -m pytest -q                   # 36 tests: token minting, setup lock, key handling, routes, persona
-node --test 'tests/js/*.test.mjs'     # 37 tests: delegation seam, result hand-off, barge-in, transcript, stop path
+python -m pytest -q                   # 85 tests: token/secret minting, chain, fallback reasons, routes, logs, persona
+node --test 'tests/js/*.test.mjs'     # 56 tests: delegation seam, hand-off, barge-in, transcript, stop path, both transports, mid-call switch
 hermes plugins validate . --install-deps
 ```
 
-The JavaScript tests drive `desktop/plugin.js` with a fake SDK, fake WebSocket and fake audio, so
-neither a key nor a microphone is needed. CI (`.github/workflows/ci.yml`) runs both suites on every
+The JavaScript tests drive `desktop/plugin.js` with a fake SDK, fake WebSocket, fake WebRTC (peer
+connection, data channel, SDP fetch) and fake audio, so neither a key, a Codex sign-in nor a
+microphone is needed. The Python route tests stand in for Hermes core's signer. CI (`.github/workflows/ci.yml`) runs both suites on every
 push and pull request, installing test dependencies with a 7-day release quarantine
 (`uv pip install --exclude-newer`).
 
@@ -236,6 +336,8 @@ push and pull request, installing test dependencies with a 7-day release quarant
 - **hermes-gemini-live** by Ha Trung (MIT), `cf549e7`: Gemini Live wire facts (setup fields the
   endpoint accepts and rejects, `NON_BLOCKING` on the declaration, `realtimeInput.text`, model
   measurements). Its delegation path (api_server `/v1/runs` in a separate session) is **not** used.
+- **hermes-live-voice** by Synero: the OpenAI Realtime client-secret body and WebRTC/SDP flow on
+  the Codex sign-in were checked against it. Its `codex app-server` child process is **not** used.
 - Delegation policy persona follows Hermes core `tools/voice_live.py`.
 - New here: Gemini ephemeral-token flow with a locked setup, delegation into the open chat with
   Gemini, Hebrew-first language switching, transcript persistence, `goAway` resumption, and the
