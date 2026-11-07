@@ -1,4 +1,4 @@
-"""Voice persona and function declarations for the Gemini Live layer.
+"""Voice persona and function declarations for the live voice layer (every provider).
 
 The delegation policy follows Hermes core's GPT-Live persona (``tools/voice_live.py::LIVE_PERSONA``):
 role + style + a labelled delegation policy, nothing more, because Hermes carries the real
@@ -12,6 +12,10 @@ instructions, tools and memory. Added here:
   actions ("I passed your feedback on", "there is no male voice"); it delegates or says it does not
   know. The real settings it may mention are listed in the prompt.
 * **Language switching** (Hebrew first by default) and the asynchronous result hand-back.
+* **Engine wording.** The persona is the same for every provider; only the sentence that says which
+  vendor's speech model carries the voice, and the voice setting key, differ (:data:`ENGINES`).
+* **Carry-over.** After a mid-call provider switch the new voice gets the recent spoken turns
+  (:func:`instructions` ``carry``) so it continues the conversation instead of starting over.
 """
 
 from __future__ import annotations
@@ -48,8 +52,8 @@ IDENTITY = (
     "You and the agent working in the chat the user has open are the same assistant: when you hand "
     "work over with hermes_task, it is you, {name}, doing it with your full tools in that chat. "
     "Introduce and refer to yourself only as {name}. Never call yourself a generic \"virtual "
-    "assistant\", Gemini or Google. If the user asks who they are talking to, or why they hear "
-    "Google: you are {name}; your voice runs on Google's Gemini Live speech model, while the work "
+    "assistant\", {product} or {vendor}. If the user asks who they are talking to, or why they hear "
+    "{vendor}: you are {name}; your voice runs on {model_line}, while the work "
     "and the memory are {name}'s, in Hermes.\n{gender}"
 )
 
@@ -62,9 +66,9 @@ HONESTY = (
     "\"[Hermes result]\" said that it happened.\n"
     "- Never say something is impossible or unsupported unless Hermes said so. If you are not sure, "
     "hand the question to hermes_task, or say plainly that you do not know.\n"
-    "- Facts about this call you may state: your voice is a Gemini prebuilt voice (male and female "
+    "- Facts about this call you may state: your voice is {voice_kind} (male and female "
     "voices exist) currently set to {voice}; voice, gender, name and starting language are plugin "
-    "settings of gemini-live-chat (keys voice, persona_gender, persona_name, language) and a change "
+    "settings of gemini-live-chat (keys {voice_key}, persona_gender, persona_name, language) and a change "
     "applies from the next call. You cannot change them during the call yourself; offer to hand the "
     "change to hermes_task instead."
 )
@@ -120,6 +124,35 @@ PERSONA = (
     "When the user says goodbye or asks to hang up, say a short goodbye and call end_call."
 )
 
+#: Per-engine wording. ``gemini`` reproduces the v0.3 prompt byte for byte.
+ENGINES: Dict[str, Dict[str, str]] = {
+    "gemini": {"product": "Gemini", "vendor": "Google", "model_line": "Google's Gemini Live speech model",
+               "voice_kind": "a Gemini prebuilt voice", "voice_key": "voice"},
+    "openai": {"product": "ChatGPT", "vendor": "OpenAI", "model_line": "OpenAI's Realtime speech model",
+               "voice_kind": "an OpenAI Realtime voice", "voice_key": "openai_voice"},
+}
+
+#: Max characters of carried-over conversation put into the next provider's instructions.
+CARRY_LIMIT = 4000
+
+CARRY = (
+    "Call so far: the voice provider changed in the middle of this call, so you are taking over a "
+    "conversation that is already going. This is what was said, newest last:\n{carry}\n"
+    "Continue from here: do not greet the user again and do not repeat what was already said. "
+    "Requests already handed to hermes_task are still being worked on in the chat; their results "
+    "will arrive as \"[Hermes result]\" messages as usual."
+)
+
+
+def clean_carry(text: Any) -> str:
+    """Recent spoken turns from the renderer, made safe for a prompt: text only, no control
+    characters (newlines kept), the newest :data:`CARRY_LIMIT` characters."""
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r"[\x00-\x09\x0b-\x1f\x7f]", " ", text).strip()
+    return text[-CARRY_LIMIT:]
+
+
 # ── identity from the profile ─────────────────────────────────────────────────────────────────────
 
 _NAME = r"([A-Z][A-Za-z'\-]{0,31})"
@@ -167,21 +200,29 @@ def identity_from_soul(text: Optional[str]) -> Tuple[Optional[str], Optional[str
 
 
 def instructions(language: str, extra: str = "", name: str = DEFAULT_PERSONA_NAME,
-                 gender: str = "male", voice: str = "", name_he: str = "") -> str:
+                 gender: str = "male", voice: str = "", name_he: str = "", engine: str = "gemini",
+                 carry: str = "") -> str:
     lang = _LANGUAGE.get((language or "he").split("-")[0], None)
     if lang is None:
         lang = (f"Start the conversation in the language with code '{language}'. Switch when the "
                 "user switches; always answer in the language the user spoke last.")
     name = (name or DEFAULT_PERSONA_NAME).strip()
+    words = ENGINES.get(engine, ENGINES["gemini"])
     identity = IDENTITY.format(
         name=name,
         name_he=f"In Hebrew your name is written and said \"{name_he}\". " if name_he else "",
         gender=_GENDER.get(gender, _GENDER["neutral"]),
+        product=words["product"], vendor=words["vendor"], model_line=words["model_line"],
     )
-    text = PERSONA.format(identity=identity, language=lang, honesty=HONESTY.format(voice=voice or "a prebuilt voice"))
+    honesty = HONESTY.format(voice=voice or "a prebuilt voice", voice_kind=words["voice_kind"],
+                             voice_key=words["voice_key"])
+    text = PERSONA.format(identity=identity, language=lang, honesty=honesty)
     extra = (extra or "").strip()
     if extra:
         text += "\n\nAdditional instructions from the user:\n" + extra
+    carry = clean_carry(carry)
+    if carry:
+        text += "\n\n" + CARRY.format(carry=carry)
     return text
 
 

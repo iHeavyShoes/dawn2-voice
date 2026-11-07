@@ -1,12 +1,29 @@
 """Backend half of gemini-live-chat, mounted at ``/api/plugins/gemini-live-chat/``.
 
-* ``GET  /status``  -> ``{available, reason, message, settings, problems}`` (key presence only)
-* ``POST /session`` -> ``{url, expires_at, model, voice, setup}``; body ``{resume_handle?}``
+* ``GET  /status``  -> ``{available, reason, message, settings, problems, providers}``
+  (credential *presence* per provider only)
+* ``POST /session`` -> the first provider of the chain that can serve:
+  ``{provider, provider_label, transport, model, voice, attempts, ...transport fields}``.
+  Body (all optional): ``{resume_handle, provider, exclude: [ids], carry, switch_from, reason}``.
 
-The Gemini key is read per request through ``agent.secret_scope.get_secret`` (profile-scoped,
-catalog rule 11), spent only inside :func:`gemini_live_chat.live.mint_session`, and never returned,
-logged or stored. The routes hold no socket and start no process: the renderer opens the Live socket
-itself with the single-use token, so stopping a call needs nothing from this side.
+  - ``provider`` + ``resume_handle``: Gemini session resumption on the provider that issued the
+    handle (no fallback: a handle belongs to its key).
+  - ``exclude``: providers the renderer already saw fail on this call, or that are cooling down
+    after a quota/auth refusal; the chain skips them.
+  - ``carry``: the recent spoken turns after a mid-call switch, put into the next provider's
+    instructions so it continues the conversation.
+
+Credentials never leave this side and are never returned or logged:
+
+* Gemini keys (``GEMINI_API_KEY``, ``GEMINI_API_KEY_PAID``) are read per request through
+  ``agent.secret_scope.get_secret`` (profile-scoped) and spent only in
+  :func:`gemini_live_chat.live.mint_session`.
+* The Codex sign-in is never read by the plugin: :func:`_codex_post` asks Hermes core
+  (``hermes_cli.plugin_provider_requests.credentialed_provider_request``) to sign one
+  ``POST /v1/realtime/client_secrets``; ``plugin.yaml`` declares ``requires_auth: [openai-codex]``.
+
+The routes hold no socket and start no process: the renderer opens the provider connection itself
+with the short-lived token/secret, so stopping a call needs nothing from this side.
 """
 
 from __future__ import annotations
@@ -14,7 +31,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -23,7 +40,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import live  # noqa: E402
+from gemini_live_chat import live, openai_rt, providers  # noqa: E402
 
 logger = logging.getLogger("gemini-live-chat")
 router = APIRouter()
@@ -32,16 +49,55 @@ NO_KEY_MESSAGE = ("Gemini Live needs GEMINI_API_KEY. Add it to this Hermes profi
                   "(Google AI Studio key), then reload the plugin.")
 
 
-def _key() -> str:
-    """The profile's key, or "" when it is missing or unscoped. Never logged."""
+def _secret(name: str) -> str:
+    """The profile's value for *name*, or "" when it is missing or unscoped. Never logged."""
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret
     except ImportError:  # outside Hermes (tests): nothing to read
         return ""
     try:
-        return (get_secret("GEMINI_API_KEY") or "").strip()
+        return (get_secret(name) or "").strip()
     except UnscopedSecretError:  # several profiles, none bound: never fall back to another's key
         return ""
+
+
+def _key() -> str:
+    """The free-tier key (kept for v0.3 callers)."""
+    return _secret("GEMINI_API_KEY")
+
+
+def _provider_requests():
+    """Hermes core's signed-request API; None on a Hermes too old to ship it."""
+    try:
+        from hermes_cli import plugin_provider_requests
+    except ImportError:
+        return None
+    return plugin_provider_requests
+
+
+def _codex_post(url: str, body: Dict[str, Any], timeout: float) -> Tuple[int, Any, str]:
+    """POST *body* to *url* with the profile's openai-codex sign-in, attached by Hermes core.
+
+    Must stay plugin code called from plugin code: core attributes the request to the plugin it
+    finds on the call stack and checks ``requires_auth`` in this plugin's ``plugin.yaml``. Only the
+    status and the JSON body come back; core never hands the token to the plugin.
+    """
+    ppr = _provider_requests()
+    if ppr is None:
+        raise openai_rt.Unsupported()
+    try:
+        r = ppr.credentialed_provider_request("openai-codex", "POST", url, json=body, timeout=timeout)
+    except ppr.ProviderNotSignedIn:
+        raise openai_rt.NotSignedIn() from None
+    try:
+        payload = r.json()
+    except Exception:  # non-JSON error page
+        payload = None
+    return r.status, payload, (r.text[:300] if r.status >= 400 else "")
+
+
+def _sources() -> providers.Sources:
+    return providers.Sources(secret=_secret, codex_post=_codex_post if _provider_requests() else None)
 
 
 SOUL_READ_LIMIT = 16_384
@@ -78,26 +134,51 @@ def _settings() -> Dict[str, Any]:
 @router.get("/status")
 def status() -> Dict[str, Any]:
     cfg = _settings()
-    ready = bool(_key())
+    chain = providers.describe(cfg["providers"], _sources())
+    ready = any(p["ready"] for p in chain)
+    only_gemini_free = [p["id"] for p in chain] == [providers.GEMINI_FREE]
+    message = None
+    if not ready:
+        message = NO_KEY_MESSAGE if only_gemini_free else providers.failure_message(
+            [{"provider": p["id"], "reason": p["reason"]} for p in chain])
     return {
         "available": ready,
         "reason": None if ready else "no_key",
-        "message": None if ready else NO_KEY_MESSAGE,
+        "message": message,
         "settings": live.client_settings(cfg),
         "problems": cfg["problems"],
+        "providers": chain,
     }
 
 
 @router.post("/session")
 def session(body: Optional[Dict[str, Any]] = None):
     body = body if isinstance(body, dict) else {}
-    try:
-        out = live.mint_session(_key(), _settings(), resume_handle=body.get("resume_handle"))
-    except live.VoiceError as exc:
-        logger.info("gemini-live-chat: session refused (%s)", exc.reason)
-        detail = exc.detail()
-        if exc.reason == "no_key":
-            detail["message"] = NO_KEY_MESSAGE
-        return JSONResponse(status_code=exc.status, content={"detail": detail})
-    logger.info("gemini-live-chat: live token minted (model=%s, expires_at=%s)", out["model"], out["expires_at"])
-    return out
+    cfg = _settings()
+    only = body.get("provider") if body.get("provider") in providers.PROVIDERS else None
+    switch_from = body.get("switch_from") if body.get("switch_from") in providers.PROVIDERS else None
+    reason = providers.clean_reason(body.get("reason"))
+    kind = "resume" if only else ("mid_call" if switch_from else "connect")
+    minted, attempts = providers.connect(
+        cfg["providers"], cfg, _sources(),
+        exclude=providers.clean_ids(body.get("exclude")),
+        only=only,
+        resume_handle=live.valid_handle(body.get("resume_handle")) if only else None,
+        carry=body.get("carry") or "",
+    )
+    if minted is None:
+        logger.info("gemini-live-chat: no voice provider could serve (%s; %s)", kind,
+                    ",".join(f"{a['provider']}:{a['reason']}" for a in attempts) or "none configured")
+        unconfigured = all(a["reason"] in providers.UNCONFIGURED for a in attempts)
+        if [a["provider"] for a in attempts] == [providers.GEMINI_FREE] and attempts[0]["reason"] == "no_key":
+            message = NO_KEY_MESSAGE
+        else:
+            message = providers.failure_message(attempts)
+        # no_key: nothing is set up (v0.3 contract); exhausted: something was tried and refused.
+        reason_out = "no_key" if unconfigured else "exhausted"
+        status_code = 503 if unconfigured or all(a["reason"] in providers.UNCONFIGURED + ("excluded",)
+                                                 for a in attempts) else 502
+        return JSONResponse(status_code=status_code,
+                            content={"detail": {"reason": reason_out, "message": message, "attempts": attempts}})
+    logger.info("gemini-live-chat: %s", providers.log_line(minted, kind, switch_from, reason))
+    return minted

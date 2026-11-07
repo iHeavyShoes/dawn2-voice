@@ -58,8 +58,7 @@ def client(secret, monkeypatch):
         return 200, {"name": "auth_tokens/route-token"}
 
     real = api.live.mint_session
-    monkeypatch.setattr(api.live, "mint_session",
-                        lambda key, cfg, resume_handle=None: real(key, cfg, resume_handle=resume_handle, poster=poster))
+    monkeypatch.setattr(api.live, "mint_session", lambda key, cfg, **kw: real(key, cfg, **{**kw, "poster": poster}))
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/gemini-live-chat")
     c = TestClient(app)
@@ -74,7 +73,13 @@ def test_status_reports_presence_only(client, secret):
     assert body["available"] is True and body["reason"] is None
     assert body["settings"]["model"] == "gemini-3.8-live"
     assert FAKE_KEY not in r.text
-    assert secret["reads"] == ["GEMINI_API_KEY"]
+    # presence of each chain key, read through secret_scope only; Codex needs no read at all
+    assert secret["reads"] == ["GEMINI_API_KEY", "GEMINI_API_KEY_PAID"]
+    chain = {p["id"]: p for p in body["providers"]}
+    assert list(chain) == ["gemini-free", "openai-codex", "gemini-paid"]
+    assert chain["gemini-free"]["ready"] is True
+    assert chain["openai-codex"]["reason"] == "unsupported"  # no core signer outside Hermes
+    assert chain["gemini-paid"]["reason"] == "no_key"
 
 
 @pytest.mark.parametrize("mode", ["missing", "unscoped"])
@@ -99,7 +104,11 @@ def test_session_mints_and_does_not_leak_the_key(client, caplog):
     assert r.status_code == 200
     body = r.json()
     assert body["url"].endswith("BidiGenerateContentConstrained?access_token=auth_tokens/route-token")
-    assert body["setup"]["setup"]["sessionResumption"] == {"handle": "h-1"}
+    # a handle is only honoured together with the provider that issued it
+    assert body["setup"]["setup"]["sessionResumption"] == {}
+    assert body["provider"] == "gemini-free" and body["transport"] == "gemini-live"
+    r = client.post("/api/plugins/gemini-live-chat/session", json={"resume_handle": "h-1", "provider": "gemini-free"})
+    assert r.json()["setup"]["setup"]["sessionResumption"] == {"handle": "h-1"}
     assert FAKE_KEY not in r.text
     assert FAKE_KEY not in caplog.text
     assert client.calls[0]["headers"]["x-goog-api-key"] == FAKE_KEY

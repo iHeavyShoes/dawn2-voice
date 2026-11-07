@@ -108,7 +108,7 @@ def test_rejected_key_is_reported_without_echoing_the_key():
     rec = Recorder(status=403, answer={"error": f"API key {FAKE_KEY} not valid"})
     with pytest.raises(live.VoiceError) as err:
         live.mint_session(FAKE_KEY, None, poster=rec)
-    assert err.value.reason == "rejected"
+    assert err.value.reason == "auth"  # v0.4: typed, so the chain can fall back
     assert FAKE_KEY not in err.value.message
     assert "GEMINI_API_KEY is valid" in err.value.message
 
@@ -142,7 +142,8 @@ def test_settings_fall_back_and_report_problems():
 def test_client_settings_carry_no_secret_and_no_instructions():
     out = live.client_settings(live.settings({"instructions": "be brief"}))
     assert set(out) == {"model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
-                        "persona_gender", "identity_source", "transcription_languages"}
+                        "persona_gender", "identity_source", "transcription_languages", "providers",
+                        "openai_model", "openai_voice"}
     assert "be brief" not in json.dumps(out)
     assert out["voice"] == "Charon"  # the effective voice, never "auto"
 

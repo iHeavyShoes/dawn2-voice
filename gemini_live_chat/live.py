@@ -83,7 +83,8 @@ Poster = Callable[[str, Dict[str, str], Dict[str, Any], float], Tuple[int, Any]]
 
 
 class VoiceError(Exception):
-    """A typed refusal. ``reason`` is machine-readable: no_key, scope, rejected, unreachable."""
+    """A typed refusal. ``reason`` is machine-readable (``providers.REASONS``): no_key, quota, auth,
+    unavailable, unreachable, rejected, not_signed_in, unsupported."""
 
     def __init__(self, reason: str, message: str, status: int = 502):
         super().__init__(message)
@@ -135,8 +136,27 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "transcript_to_chat": pick("transcript_to_chat", lambda v: v in TRANSCRIPT_MODES, DEFAULT_TRANSCRIPT_MODE),
         "half_duplex": raw.get("half_duplex") is True,
         "api_version": pick("api_version", lambda v: v in API_VERSIONS, DEFAULT_API_VERSION),
+        # v0.4: the provider chain (order of providers.PROVIDERS ids) and the OpenAI Realtime engine.
+        "providers": _providers(raw.get("providers"), problems),
+        "openai_model": str(pick("openai_model", _valid_openai_model, _OPENAI_DEFAULT_MODEL)).strip(),
+        "openai_voice": pick("openai_voice", lambda v: v == AUTO or v in _OPENAI_VOICES, AUTO),
         "problems": problems,
     }
+
+
+# Late-bound to keep live.py importable on its own (openai_rt and providers import live).
+_OPENAI_DEFAULT_MODEL = "gpt-realtime-2.1"
+_OPENAI_VOICES = ("alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar")
+
+
+def _valid_openai_model(value: Any) -> bool:
+    from . import openai_rt
+    return openai_rt.valid_model(value)
+
+
+def _providers(raw: Any, problems: list) -> list:
+    from . import providers
+    return providers.parse_order(raw, problems)
 
 
 def _as_list(raw: Any) -> Optional[list]:
@@ -205,7 +225,7 @@ def resolve_persona(cfg: Dict[str, Any], soul_text: Optional[str] = None) -> Dic
     return out
 
 
-def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None) -> Dict[str, Any]:
+def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None, carry: str = "") -> Dict[str, Any]:
     """The ``BidiGenerateContentSetup`` body (camelCase wire names, as the endpoint accepts them).
 
     Fields accepted by the endpoint per the API reference and the measurements published in
@@ -233,7 +253,7 @@ def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None) -> Dic
         },
         "systemInstruction": {"parts": [{"text": persona.instructions(
             cfg["language"], cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
-            voice=cfg["voice"], name_he=cfg.get("persona_name_he", ""))}]},
+            voice=cfg["voice"], name_he=cfg.get("persona_name_he", ""), engine="gemini", carry=carry)}]},
         "tools": [{"functionDeclarations": persona.tool_declarations(name)}],
         "realtimeInputConfig": {"automaticActivityDetection": {
             "silenceDurationMs": cfg["silence_ms"], "prefixPaddingMs": PREFIX_MS}},
@@ -277,18 +297,41 @@ def valid_handle(handle: Any) -> Optional[str]:
     return None
 
 
+def classify(status: int, detail: Any) -> str:
+    """Map a refused token request to a fallback reason (see ``providers.REASONS``): ``quota`` for
+    429 / RESOURCE_EXHAUSTED, ``auth`` for a bad or unauthorised key, ``unavailable`` for 5xx."""
+    low = json.dumps(detail).lower() if not isinstance(detail, str) else detail.lower()
+    if status == 429 or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
+        return "quota"
+    if status in (401, 403) or "api_key_invalid" in low or "permission_denied" in low or "api key not valid" in low:
+        return "auth"
+    if status >= 500:
+        return "unavailable"
+    return "rejected"
+
+
+_REFUSALS = {
+    "quota": "Google refused the Live token request: quota or rate limit reached ({status}).",
+    "auth": "Google refused the Live token request ({status}). Check that {key_name} is valid.",
+    "unavailable": "Google's Live service is unavailable right now ({status}).",
+    "rejected": "Google refused the Live token request ({status}).",
+}
+
+
 def mint_session(key: Optional[str], cfg: Optional[Dict[str, Any]], resume_handle: Optional[str] = None,
-                 poster: Optional[Poster] = None, now: Optional[_dt.datetime] = None) -> Dict[str, Any]:
+                 poster: Optional[Poster] = None, now: Optional[_dt.datetime] = None, carry: str = "",
+                 key_name: str = "GEMINI_API_KEY") -> Dict[str, Any]:
     """Ephemeral token + socket URL + the setup frame for the renderer. Raises :class:`VoiceError`.
 
+    *carry* is the recent conversation after a mid-call provider switch (into the persona).
     The returned body never contains the API key (asserted by the tests)."""
     key = (key or "").strip()
     if not key:
-        raise VoiceError("no_key", "Gemini Live needs GEMINI_API_KEY in this Hermes profile's environment.", 503)
+        raise VoiceError("no_key", f"Gemini Live needs {key_name} in this Hermes profile's environment.", 503)
     cfg = cfg if isinstance(cfg, dict) and "problems" in cfg else settings(cfg)
     if "identity_source" not in cfg:
         cfg = resolve_persona(cfg)
-    setup = build_setup(cfg, valid_handle(resume_handle))
+    setup = build_setup(cfg, valid_handle(resume_handle), carry=carry)
     now = now or _dt.datetime.now(tz=_dt.timezone.utc)
     body = {
         "uses": 1,
@@ -308,8 +351,10 @@ def mint_session(key: Optional[str], cfg: Optional[Dict[str, Any]], resume_handl
     except Exception as exc:  # DNS, TLS, timeout
         raise VoiceError("unreachable", f"Google is unreachable ({type(exc).__name__}).", 502) from None
     if status >= 400 or not isinstance(answer, dict):
-        hint = " Check that GEMINI_API_KEY is valid." if status in (400, 401, 403) else ""
-        raise VoiceError("rejected", _scrub(f"Google refused the Live token request ({status}).{hint}", key), 502)
+        reason = classify(status, answer) if status >= 400 else "rejected"
+        if reason == "rejected" and status == 400 and "api key" in json.dumps(answer).lower():
+            reason = "auth"  # Google answers an invalid key with 400 INVALID_ARGUMENT
+        raise VoiceError(reason, _scrub(_REFUSALS[reason].format(status=status, key_name=key_name), key), 502)
     token = answer.get("name")
     if not isinstance(token, str) or not token or key in token:
         raise VoiceError("rejected", "Unexpected answer from Google's token service.", 502)
@@ -329,5 +374,6 @@ def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if "identity_source" not in cfg:
         cfg = resolve_persona(cfg)
     keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
-            "persona_gender", "identity_source", "transcription_languages")
+            "persona_gender", "identity_source", "transcription_languages", "providers",
+            "openai_model", "openai_voice")
     return {k: cfg[k] for k in keys}
