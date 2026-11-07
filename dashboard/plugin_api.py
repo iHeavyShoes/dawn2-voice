@@ -44,14 +44,35 @@ def _key() -> str:
         return ""
 
 
+SOUL_READ_LIMIT = 16_384
+
+
+def _soul_text() -> Optional[str]:
+    """The head of the serving profile's ``SOUL.md`` (``hermes_constants.get_hermes_home()``, the
+    home this request is scoped to), or None. Only the agent's name and stated gender are extracted
+    from it (:func:`gemini_live_chat.persona.identity_from_soul`); the text itself is not sent."""
+    try:
+        from hermes_constants import get_hermes_home
+        path = Path(get_hermes_home()) / "SOUL.md"
+        if not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
+            return fh.read(SOUL_READ_LIMIT)
+    except Exception:  # outside Hermes (tests) or unreadable: the persona falls back to settings/defaults
+        return None
+
+
 def _settings() -> Dict[str, Any]:
+    """This profile's ``plugins.entries.gemini-live-chat.settings`` (``load_config`` is scoped to the
+    profile the request is for), with the persona resolved against that profile's SOUL.md."""
     try:
         from hermes_cli.config import load_config_readonly
         entry = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
-        return live.settings(entry.get("settings"))
+        cfg = live.settings(entry.get("settings"))
     except Exception:
         logger.warning("gemini-live-chat: settings unreadable, using defaults")
-        return live.settings(None)
+        cfg = live.settings(None)
+    return live.resolve_persona(cfg, _soul_text())
 
 
 @router.get("/status")

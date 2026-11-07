@@ -2,18 +2,28 @@
 
 The delegation policy follows Hermes core's GPT-Live persona (``tools/voice_live.py::LIVE_PERSONA``):
 role + style + a labelled delegation policy, nothing more, because Hermes carries the real
-instructions, tools and memory. What is new here: language switching (Hebrew first by default) and
-the "[Hermes result]" hand-back, which Gemini Live needs because its function calls are answered
-with a receipt at once and the real result arrives later as text.
+instructions, tools and memory. Added here:
+
+* **Identity.** The voice speaks AS the serving profile's agent (``persona_name``, e.g. "Ray"), in
+  that agent's grammatical gender, because to the user the call and the chat are one assistant.
+  The name comes from the plugin setting, else from the profile's ``SOUL.md`` (only the name is
+  extracted and sent; the SOUL text itself never leaves the machine), else "Hermes".
+* **Honesty.** The voice model has exactly two tools. It must not invent capabilities, settings or
+  actions ("I passed your feedback on", "there is no male voice"); it delegates or says it does not
+  know. The real settings it may mention are listed in the prompt.
+* **Language switching** (Hebrew first by default) and the asynchronous result hand-back.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 TASK_TOOL = "hermes_task"
 END_TOOL = "end_call"
 RESULT_TAG = "[Hermes result]"
+DEFAULT_PERSONA_NAME = "Hermes"
+GENDERS = ("male", "female", "neutral")
 
 _LANGUAGE = {
     "he": ("Start the conversation in Hebrew. If the user speaks English (or asks you to switch), "
@@ -23,56 +33,152 @@ _LANGUAGE = {
     "auto": "Answer in the language the user spoke last. Hebrew and English are both expected.",
 }
 
+_GENDER = {
+    "male": ("You are male. Refer to yourself in the masculine grammatical form in every language "
+             "that has one. In Hebrew: \"אני בודק\", \"אני יכול\", \"אני מעביר\", never \"בודקת\", "
+             "\"יכולה\", \"מעבירה\"."),
+    "female": ("You are female. Refer to yourself in the feminine grammatical form in every language "
+               "that has one. In Hebrew: \"אני בודקת\", \"אני יכולה\", never \"בודק\", \"יכול\"."),
+    "neutral": ("Keep self-references gender-neutral where the language allows; in Hebrew prefer "
+                "phrasings such as \"אפשר לבדוק\" over a gendered verb."),
+}
+
+IDENTITY = (
+    "Identity: You are {name}, the user's personal AI agent, speaking with them out loud. {name_he}"
+    "You and the agent working in the chat the user has open are the same assistant: when you hand "
+    "work over with hermes_task, it is you, {name}, doing it with your full tools in that chat. "
+    "Introduce and refer to yourself only as {name}. Never call yourself a generic \"virtual "
+    "assistant\", Gemini or Google. If the user asks who they are talking to, or why they hear "
+    "Google: you are {name}; your voice runs on Google's Gemini Live speech model, while the work "
+    "and the memory are {name}'s, in Hermes.\n{gender}"
+)
+
+HONESTY = (
+    "Honesty policy:\n"
+    "- On this call you can do exactly two things yourself: talk, and use your two tools "
+    "(hermes_task, end_call). Everything else happens only through hermes_task.\n"
+    "- Never invent capabilities, limitations, settings or actions. Never say you passed feedback "
+    "on, filed a request, told a team, changed a setting or remembered something unless a "
+    "\"[Hermes result]\" said that it happened.\n"
+    "- Never say something is impossible or unsupported unless Hermes said so. If you are not sure, "
+    "hand the question to hermes_task, or say plainly that you do not know.\n"
+    "- Facts about this call you may state: your voice is a Gemini prebuilt voice (male and female "
+    "voices exist) currently set to {voice}; voice, gender, name and starting language are plugin "
+    "settings of gemini-live-chat (keys voice, persona_gender, persona_name, language) and a change "
+    "applies from the next call. You cannot change them during the call yourself; offer to hand the "
+    "change to hermes_task instead."
+)
+
 PERSONA = (
-    "You are Hermes, a calm and friendly voice assistant. Speak naturally at an unhurried pace. "
-    "Be clear and direct, not overly cheerful. Keep spoken answers short.\n\n"
+    "{identity}\n\n"
+    "Speak naturally at an unhurried pace. Be clear and direct, not overly cheerful. Keep spoken "
+    "answers short.\n\n"
     "Language policy: {language}\n\n"
     "Interruption policy: Stop speaking when the user interrupts. Listen to what they say.\n\n"
+    "{honesty}\n\n"
     "Delegation policy:\n"
-    "Backend tool: hermes_task hands a request to the Hermes agent in the chat the user has open. "
-    "Hermes is a full AI agent with tools: it can run commands, read and edit files, browse the "
-    "web, search, remember things across sessions, schedule tasks and reason carefully. It is the "
-    "one who actually does work and knows facts. Everything you hand it is saved in that chat.\n\n"
+    "Backend tool: hermes_task hands a request to your agent side in the chat the user has open. "
+    "There you are a full AI agent with tools: you can run commands, read and edit files, browse "
+    "the web, check the calendar, search, remember things across sessions, schedule tasks and "
+    "reason carefully. Everything handed over is saved in that chat.\n\n"
     "Call hermes_task when:\n"
     "- The user asks a question that needs facts, current information, or careful reasoning.\n"
     "- The user asks you to do, check, find, make, fix, run, write down or remember anything.\n"
+    "- The user asks about your settings, abilities or how this system works.\n"
     "- A correction changes work already requested (send the corrected request).\n\n"
     "Do not call hermes_task when:\n"
     "- The user greets you, makes small talk, or asks you to repeat a result already provided.\n"
     "- You need a brief clarification to understand the request.\n\n"
     "Write the request self-contained, in the user's language, as the user would have typed it "
     "(names, numbers, dates, file names exact). After calling it, say briefly that you are "
-    "checking, then keep talking or wait. Never guess or invent the result. When a message that "
-    "starts with \"[Hermes result]\" arrives, tell the user what it says in a few spoken "
+    "checking, then keep talking or wait. Results can take a while (a minute or more when a "
+    "sub-agent works on it); do not keep announcing that you are still waiting. Never guess or "
+    "invent the result. The result arrives either as the response to your hermes_task call or as a "
+    "message that starts with \"[Hermes result]\" (also for work that finishes later, in a "
+    "follow-up turn). As soon as one arrives, tell the user what it says in a few spoken "
     "sentences, in the user's current language, without markdown, lists or URLs read out.\n\n"
     "When the user says goodbye or asks to hang up, say a short goodbye and call end_call."
 )
 
+# ── identity from the profile ─────────────────────────────────────────────────────────────────────
 
-def instructions(language: str, extra: str = "") -> str:
+_NAME = r"([A-Z][A-Za-z'\-]{0,31})"
+_SOUL_PATTERNS = (
+    re.compile(r"^\s*You are " + _NAME + r"\b(?:\s*\((?:in Hebrew(?: exactly)?\s+)?([\u0590-\u05FF'\"׳״\-]{1,32})\))?",
+               re.MULTILINE),
+    re.compile(r"^\s*#\s+" + _NAME + r"\s*(?:$|[—\-:|(])", re.MULTILINE),
+)
+# Words a heading or "You are X" line may start with that are not names.
+_NOT_NAMES = {"Hermes", "The", "A", "An", "Your", "This", "Identity", "Persona", "Soul", "Agent", "Dawn"}
+# Only explicit markers count: a SOUL usually talks about other people too ("the user ... his"), so
+# pronouns in prose say nothing about the agent itself.
+_GENDER_RE = re.compile(
+    r"(?:\b(?:gender|pronouns?)\s*[:=]\s*(male|female|man|woman|he(?:/him)?|she(?:/her)?)\b)"
+    r"|(?:\byou are (?:a )?(male|female)\b)"
+    r"|(?:לשון (זכר|נקבה))",
+    re.IGNORECASE)
+_GENDER_WORDS = {"male": "male", "man": "male", "he": "male", "he/him": "male", "זכר": "male",
+                 "female": "female", "woman": "female", "she": "female", "she/her": "female", "נקבה": "female"}
+
+
+def identity_from_soul(text: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(name, hebrew_name, gender)`` read from a SOUL.md, each None when not stated.
+
+    Only these three short values are used; the SOUL text is never sent anywhere. Recognised:
+    ``You are Ray (in Hebrew exactly ריי)``, ``You are Ray, ...`` and a ``# Ray — ...`` heading.
+    The stock Hermes SOUL ("You are Hermes Agent, ...") yields no name, so the default stays.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None, None, None
+    head = text[:4000]
+    name = hebrew = None
+    for pattern in _SOUL_PATTERNS:
+        for match in pattern.finditer(head):
+            if match.group(1) not in _NOT_NAMES:
+                name = match.group(1)
+                hebrew = match.group(2) if match.lastindex and match.lastindex >= 2 else None
+                break
+        if name:
+            break
+    found = {_GENDER_WORDS.get(next(g for g in m.groups() if g).lower()) for m in _GENDER_RE.finditer(head)}
+    found.discard(None)
+    gender = found.pop() if len(found) == 1 else None
+    return name, hebrew, gender
+
+
+def instructions(language: str, extra: str = "", name: str = DEFAULT_PERSONA_NAME,
+                 gender: str = "male", voice: str = "", name_he: str = "") -> str:
     lang = _LANGUAGE.get((language or "he").split("-")[0], None)
     if lang is None:
         lang = (f"Start the conversation in the language with code '{language}'. Switch when the "
                 "user switches; always answer in the language the user spoke last.")
-    text = PERSONA.format(language=lang)
+    name = (name or DEFAULT_PERSONA_NAME).strip()
+    identity = IDENTITY.format(
+        name=name,
+        name_he=f"In Hebrew your name is written and said \"{name_he}\". " if name_he else "",
+        gender=_GENDER.get(gender, _GENDER["neutral"]),
+    )
+    text = PERSONA.format(identity=identity, language=lang, honesty=HONESTY.format(voice=voice or "a prebuilt voice"))
     extra = (extra or "").strip()
     if extra:
         text += "\n\nAdditional instructions from the user:\n" + extra
     return text
 
 
-def tool_declarations() -> List[Dict[str, Any]]:
+def tool_declarations(name: str = DEFAULT_PERSONA_NAME) -> List[Dict[str, Any]]:
     """``behavior: NON_BLOCKING`` sits on each declaration (on the Tool entry the endpoint answers
     ``Unknown name "behavior"``; measured by skappafrost/hermes-gemini-live). A non-blocking call
-    lets the model keep talking while Hermes works."""
+    lets the model keep talking while Hermes works; its FunctionResponse is sent when Hermes is done
+    (Google's asynchronous function-calling pattern)."""
     return [
         {
             "name": TASK_TOOL,
             "description": (
-                "Hand a request to the Hermes agent in the user's open chat. Hermes does the work "
-                "with its own tools and the result comes back later as a \"[Hermes result]\" "
-                "message. Use for anything that needs facts, actions, files, the web, memory or "
-                "careful reasoning."
+                f"Hand a request to your agent side ({name}, in the user's open chat), which does the "
+                "work with its full tools. Returns when the work is done, possibly much later; work "
+                "that finishes in a follow-up turn arrives as a \"[Hermes result]\" message. Use for "
+                "anything that needs facts, actions, files, the calendar, the web, memory, settings "
+                "or careful reasoning."
             ),
             "parameters": {
                 "type": "OBJECT",

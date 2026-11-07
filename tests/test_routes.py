@@ -126,3 +126,47 @@ def test_register_logs_but_never_raises_without_a_key(secret, caplog):
     caplog.set_level(logging.INFO)
     mod.register(object())
     assert "GEMINI_API_KEY is not set" in caplog.text
+
+
+@pytest.fixture
+def profile(monkeypatch, tmp_path):
+    """A profile home with SOUL.md and plugin settings, the way the gateway scopes a request."""
+    consts = types.ModuleType("hermes_constants")
+    consts.get_hermes_home = lambda: tmp_path
+    cli = types.ModuleType("hermes_cli")
+    config = types.ModuleType("hermes_cli.config")
+    state = {"settings": {}}
+    config.load_config_readonly = lambda: {"plugins": {"entries": {"gemini-live-chat": {"settings": state["settings"]}}}}
+    cli.config = config
+    monkeypatch.setitem(sys.modules, "hermes_constants", consts)
+    monkeypatch.setitem(sys.modules, "hermes_cli", cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    (tmp_path / "SOUL.md").write_text(
+        "# Ray — Dawn 2.0\n\nYou are Ray (in Hebrew exactly ריי), the orchestrator. SECRET-SOUL-LINE\n",
+        encoding="utf-8")
+    return state
+
+
+def test_status_and_session_speak_as_the_profile_agent(client, profile):
+    s = client.get("/api/plugins/gemini-live-chat/status").json()["settings"]
+    assert (s["persona_name"], s["persona_gender"], s["identity_source"], s["voice"]) == ("Ray", "male", "soul", "Charon")
+    r = client.post("/api/plugins/gemini-live-chat/session", json={})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["persona_name"] == "Ray" and out["voice"] == "Charon"
+    assert "You are Ray" in out["setup"]["setup"]["systemInstruction"]["parts"][0]["text"]
+    # only the name crosses the wire: the SOUL text itself never goes to Google
+    assert "SECRET-SOUL-LINE" not in r.text and "SECRET-SOUL-LINE" not in json.dumps(client.calls)
+
+
+def test_profile_settings_override_the_soul(client, profile):
+    profile["settings"] = {"persona_name": "Noa", "persona_gender": "female", "voice": "Kore", "language": "en"}
+    s = client.get("/api/plugins/gemini-live-chat/status").json()["settings"]
+    assert (s["persona_name"], s["persona_gender"], s["identity_source"], s["voice"]) == ("Noa", "female", "setting", "Kore")
+    assert s["transcription_languages"] == ["en", "he"]
+
+
+def test_no_soul_falls_back_to_hermes(client, profile, tmp_path):
+    (tmp_path / "SOUL.md").unlink()
+    s = client.get("/api/plugins/gemini-live-chat/status").json()["settings"]
+    assert (s["persona_name"], s["identity_source"], s["voice"]) == ("Hermes", "default", "Charon")

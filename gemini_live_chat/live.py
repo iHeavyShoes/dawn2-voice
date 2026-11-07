@@ -37,8 +37,14 @@ API_VERSIONS = ("v1alpha", "v1beta")
 DEFAULT_API_VERSION = "v1alpha"
 
 DEFAULT_MODEL = "gemini-3.8-live"  # Google's default Live model (models page, 2026-11)
-DEFAULT_VOICE = "Aoede"
+AUTO = "auto"
+DEFAULT_VOICE = AUTO  # follows the persona's gender: MALE_VOICE or FEMALE_VOICE
+MALE_VOICE = "Charon"
+FEMALE_VOICE = "Aoede"
 DEFAULT_LANGUAGE = "he"
+PERSONA_GENDERS = (AUTO,) + persona.GENDERS
+#: When neither the setting, the profile's SOUL.md nor an explicit voice says otherwise.
+FALLBACK_GENDER = "male"
 DEFAULT_SILENCE_MS = 1000
 SILENCE_MS_RANGE = (400, 5000)
 PREFIX_MS = 300
@@ -58,8 +64,19 @@ VOICES = (
     "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird",
     "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
 )
+#: How each prebuilt voice sounds, as labelled in Google AI Studio's voice picker. Used only to pick
+#: matching grammatical forms when ``persona_gender`` is ``auto`` and an explicit voice is set.
+VOICE_GENDER = {
+    **dict.fromkeys(("Puck", "Charon", "Fenrir", "Orus", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+                     "Algenib", "Rasalgethi", "Alnilam", "Schedar", "Achird", "Zubenelgenubi",
+                     "Sadachbia", "Sadaltager"), "male"),
+    **dict.fromkeys(("Zephyr", "Kore", "Leda", "Aoede", "Callirrhoe", "Autonoe", "Despina", "Erinome",
+                     "Laomedeia", "Achernar", "Gacrux", "Pulcherrima", "Vindemiatrix", "Sulafat"), "female"),
+}
 _MODEL_RE = re.compile(r"^(models/)?gemini-[a-z0-9.\-]+$")
 _LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+_PERSONA_NAME_RE = re.compile(r"^[^\x00-\x1f{}<>\[\]\"\\]{1,40}$")
+MAX_VOCABULARY = 100  # Google: up to 1,000 terms, best results with up to 100
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9_\-./=+:]{1,2048}$")
 
 Poster = Callable[[str, Dict[str, str], Dict[str, Any], float], Tuple[int, Any]]
@@ -104,10 +121,15 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     model = str(pick("model", lambda v: isinstance(v, str) and bool(_MODEL_RE.match(v.strip())), DEFAULT_MODEL)).strip()
     if model.startswith("models/"):
         model = model[len("models/"):]
+    language = pick("language", lambda v: v == AUTO or (isinstance(v, str) and bool(_LANG_RE.match(v))), DEFAULT_LANGUAGE)
     return {
         "model": model,
-        "voice": pick("voice", lambda v: v in VOICES, DEFAULT_VOICE),
-        "language": pick("language", lambda v: isinstance(v, str) and bool(_LANG_RE.match(v)), DEFAULT_LANGUAGE),
+        "voice": pick("voice", lambda v: v == AUTO or v in VOICES, DEFAULT_VOICE),
+        "persona_name": str(pick("persona_name", lambda v: isinstance(v, str) and bool(_PERSONA_NAME_RE.match(v.strip())), "")).strip(),
+        "persona_gender": pick("persona_gender", lambda v: v in PERSONA_GENDERS, AUTO),
+        "language": language,
+        "transcription_languages": _languages(raw.get("transcription_languages"), language, problems),
+        "vocabulary": _vocabulary(raw.get("vocabulary"), problems),
         "silence_ms": _int_in(raw.get("silence_ms"), DEFAULT_SILENCE_MS, SILENCE_MS_RANGE),
         "instructions": str(raw.get("instructions") or "").strip()[:4000],
         "transcript_to_chat": pick("transcript_to_chat", lambda v: v in TRANSCRIPT_MODES, DEFAULT_TRANSCRIPT_MODE),
@@ -117,6 +139,72 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _as_list(raw: Any) -> Optional[list]:
+    if isinstance(raw, str):
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    if isinstance(raw, (list, tuple)):
+        return [str(p).strip() for p in raw if str(p).strip()]
+    return None
+
+
+def _languages(raw: Any, language: str, problems: list) -> list:
+    """BCP-47 hints for ``inputAudioTranscription.languageCodes``. Unset: the starting language
+    first, then the other of Hebrew/English (so switching keeps working); ``auto`` or an empty list:
+    no hints, Google detects the language itself."""
+    if raw in (None, ""):
+        if language == AUTO:
+            return []
+        base = language.split("-")[0]
+        other = {"he": "en", "en": "he"}.get(base)
+        return [language] + ([other] if other else [])
+    if raw == AUTO:
+        return []
+    codes = _as_list(raw)
+    if codes is None or not all(_LANG_RE.match(c) for c in codes):
+        problems.append(f"settings.transcription_languages {raw!r} is not valid; using automatic detection")
+        return []
+    return codes[:8]
+
+
+def _vocabulary(raw: Any, problems: list) -> list:
+    if raw in (None, ""):
+        return []
+    terms = _as_list(raw)
+    if terms is None:
+        problems.append(f"settings.vocabulary {raw!r} is not valid; ignoring it")
+        return []
+    return [t[:80] for t in terms][:MAX_VOCABULARY]
+
+
+def resolve_persona(cfg: Dict[str, Any], soul_text: Optional[str] = None) -> Dict[str, Any]:
+    """Who the voice is and how it sounds, in this order of precedence:
+
+    * name: ``persona_name`` setting > the profile's ``SOUL.md`` ("You are Ray ...") > "Hermes";
+    * grammatical gender: ``persona_gender`` setting > ``SOUL.md`` > the explicit voice's sound >
+      ``FALLBACK_GENDER`` (male);
+    * voice: an explicit ``voice`` setting always wins; ``auto`` picks ``MALE_VOICE`` or
+      ``FEMALE_VOICE`` by the gender.
+
+    Returns a copy of ``cfg`` with ``persona_name``, ``persona_name_he``, ``persona_gender`` and
+    ``voice`` resolved (``identity_source`` says where the name came from)."""
+    out = dict(cfg)
+    soul_name, soul_he, soul_gender = persona.identity_from_soul(soul_text)
+    if cfg.get("persona_name"):
+        out["persona_name"], out["identity_source"] = cfg["persona_name"], "setting"
+        out["persona_name_he"] = soul_he if soul_name and soul_name.lower() == cfg["persona_name"].lower() else ""
+    elif soul_name:
+        out["persona_name"], out["persona_name_he"], out["identity_source"] = soul_name, soul_he or "", "soul"
+    else:
+        out["persona_name"], out["persona_name_he"], out["identity_source"] = persona.DEFAULT_PERSONA_NAME, "", "default"
+    voice = cfg.get("voice") or AUTO
+    gender = cfg.get("persona_gender") or AUTO
+    if gender == AUTO:
+        gender = soul_gender or (VOICE_GENDER.get(voice) if voice != AUTO else None) or FALLBACK_GENDER
+    out["persona_gender"] = gender
+    out["voice"] = voice if voice != AUTO else (FEMALE_VOICE if gender == "female" else MALE_VOICE)
+    return out
+
+
 def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None) -> Dict[str, Any]:
     """The ``BidiGenerateContentSetup`` body (camelCase wire names, as the endpoint accepts them).
 
@@ -124,17 +212,32 @@ def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None) -> Dic
     skappafrost/hermes-gemini-live (setup frame shape, NON_BLOCKING on the declaration, no
     ``thinkingLevel`` for gemini-3.8-live).
     """
+    if "identity_source" not in cfg:
+        cfg = resolve_persona(cfg)
+    name = cfg["persona_name"]
+    # Input transcription: language hints + names it must spell right. The voice model hears the
+    # audio itself; this only shapes the transcript (chat record and voice_context for Hermes).
+    transcription: Dict[str, Any] = {}
+    if cfg.get("transcription_languages"):
+        transcription["languageCodes"] = list(cfg["transcription_languages"])
+    vocabulary = [t for t in [name, cfg.get("persona_name_he", "")] + list(cfg.get("vocabulary") or []) if t]
+    if vocabulary:
+        transcription["customVocabulary"] = list(dict.fromkeys(vocabulary))[:MAX_VOCABULARY]
     setup: Dict[str, Any] = {
         "model": f"models/{cfg['model']}",
         "generationConfig": {
             "responseModalities": ["AUDIO"],
+            # No speechConfig.languageCode: native-audio models pick the spoken language themselves
+            # (the persona's language policy steers it), and the code would pin one language.
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": cfg["voice"]}}},
         },
-        "systemInstruction": {"parts": [{"text": persona.instructions(cfg["language"], cfg.get("instructions", ""))}]},
-        "tools": [{"functionDeclarations": persona.tool_declarations()}],
+        "systemInstruction": {"parts": [{"text": persona.instructions(
+            cfg["language"], cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
+            voice=cfg["voice"], name_he=cfg.get("persona_name_he", ""))}]},
+        "tools": [{"functionDeclarations": persona.tool_declarations(name)}],
         "realtimeInputConfig": {"automaticActivityDetection": {
             "silenceDurationMs": cfg["silence_ms"], "prefixPaddingMs": PREFIX_MS}},
-        "inputAudioTranscription": {},
+        "inputAudioTranscription": transcription,
         "outputAudioTranscription": {},
         # Without the sliding window an audio-only session hard-stops near 15 minutes.
         "contextWindowCompression": {"slidingWindow": {}},
@@ -183,6 +286,8 @@ def mint_session(key: Optional[str], cfg: Optional[Dict[str, Any]], resume_handl
     if not key:
         raise VoiceError("no_key", "Gemini Live needs GEMINI_API_KEY in this Hermes profile's environment.", 503)
     cfg = cfg if isinstance(cfg, dict) and "problems" in cfg else settings(cfg)
+    if "identity_source" not in cfg:
+        cfg = resolve_persona(cfg)
     setup = build_setup(cfg, valid_handle(resume_handle))
     now = now or _dt.datetime.now(tz=_dt.timezone.utc)
     body = {
@@ -213,10 +318,16 @@ def mint_session(key: Optional[str], cfg: Optional[Dict[str, Any]], resume_handl
         "expires_at": body["expireTime"],
         "model": cfg["model"],
         "voice": cfg["voice"],
+        "persona_name": cfg["persona_name"],
         "setup": {"setup": setup},
     }
 
 
 def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """The non-secret settings the renderer needs (status route)."""
-    return {k: cfg[k] for k in ("model", "voice", "language", "transcript_to_chat", "half_duplex")}
+    """The non-secret settings the renderer needs (status route): the effective values, after the
+    persona is resolved (so ``voice`` is the real voice name, never ``auto``)."""
+    if "identity_source" not in cfg:
+        cfg = resolve_persona(cfg)
+    keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
+            "persona_gender", "identity_source", "transcription_languages")
+    return {k: cfg[k] for k in keys}
