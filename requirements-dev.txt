@@ -1,0 +1,5 @@
+# Test-only dependencies. The plugin itself ships no Python dependencies:
+# at runtime it uses the standard library plus FastAPI, which Hermes already provides.
+pytest>=8.0,<10
+fastapi>=0.110,<1
+httpx>=0.27,<1

@@ -1,0 +1,118 @@
+// Loads desktop/plugin.js with its two SDK imports pointed at in-memory fakes, and provides fake
+// WebSocket / AudioContext / microphone objects that record every resource opened and released.
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, dirname } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const PLUGIN = join(here, '..', '..', 'desktop', 'plugin.js')
+
+export function makeSdk () {
+  const requests = []
+  const notes = []
+  const atom = v => ({ value: v, get () { return this.value } })
+  const sdk = {
+    requests,
+    notes,
+    requestImpl: async (method, params) => ({ status: 'streaming' }),
+    host: {
+      state: { activeSessionId: atom('sess-1'), focusedSessionId: atom('sess-1') },
+      request: (method, params) => { requests.push({ method, params }); return sdk.requestImpl(method, params) },
+      notify: n => { notes.push(n) }
+    },
+    icons: { AudioLines: 'AudioLines', VolumeX: 'VolumeX', PhoneOff: 'PhoneOff', iconSize: { sm: 'sm' } }
+  }
+  return sdk
+}
+
+export async function loadPlugin (sdk) {
+  const dir = mkdtempSync(join(tmpdir(), 'glc-'))
+  writeFileSync(join(dir, 'sdk.mjs'), 'export const host = globalThis.__glcSdk.host; export const icons = globalThis.__glcSdk.icons\n')
+  writeFileSync(join(dir, 'react.mjs'), 'export const createElement = (...a) => a; export const useEffect = () => {}; export const useState = v => [v, () => {}]\n')
+  const src = readFileSync(PLUGIN, 'utf8')
+    .replace("from '@hermes/plugin-sdk'", "from './sdk.mjs'")
+    .replace("from 'react'", "from './react.mjs'")
+  if (/^import .*from '(?!\.\/)/m.test(src)) throw new Error('import rewrite failed')
+  writeFileSync(join(dir, 'plugin.mjs'), src)
+  globalThis.__glcSdk = sdk
+  return import(pathToFileURL(join(dir, 'plugin.mjs')).href)
+}
+
+export function makeEnv () {
+  const ledger = { sockets: [], contexts: [], tracks: [], timers: new Map(), nextTimer: 1, micCalls: 0, micGate: null }
+  class FakeWS {
+    constructor (url) {
+      this.url = url
+      this.readyState = 0
+      this.sent = []
+      this.closed = false
+      ledger.sockets.push(this)
+    }
+    send (data) { if (this.readyState !== 1) throw new Error('send on closed socket'); this.sent.push(JSON.parse(data)) }
+    close () { this.readyState = 3; this.closed = true }
+    // test drivers
+    open () { this.readyState = 1; this.onopen && this.onopen() }
+    serve (msg) { this.onmessage && this.onmessage({ data: JSON.stringify(msg) }) }
+    drop (code = 1011, reason = 'gone') { this.readyState = 3; this.onclose && this.onclose({ code, reason }) }
+  }
+  class FakeAudioContext {
+    constructor (opts) {
+      this.sampleRate = (opts && opts.sampleRate) || 48000
+      this.state = 'running'
+      this.currentTime = 0
+      this.destination = {}
+      this.sources = []
+      this.audioWorklet = { addModule: async () => {} }
+      ledger.contexts.push(this)
+    }
+    resume () { return Promise.resolve() }
+    close () { this.state = 'closed'; return Promise.resolve() }
+    createMediaStreamSource () { return { connect () {}, disconnect () {} } }
+    createBuffer (ch, len, rate) { const data = new Float32Array(len); return { duration: len / rate, getChannelData: () => data } }
+    createBufferSource () {
+      const ctx = this
+      const node = { stopped: false, connect () {}, start () {}, stop () { node.stopped = true; node.onended && node.onended() } }
+      ctx.sources.push(node)
+      return node
+    }
+  }
+  class FakeWorkletNode {
+    constructor () { this.port = { onmessage: null }; ledger.worklet = this }
+    connect () {}
+    disconnect () {}
+  }
+  const env = {
+    WebSocket: FakeWS,
+    AudioContext: FakeAudioContext,
+    AudioWorkletNode: FakeWorkletNode,
+    getUserMedia: async () => {
+      ledger.micCalls += 1
+      if (ledger.micGate) await ledger.micGate
+      const track = { stopped: false, stop () { this.stopped = true } }
+      ledger.tracks.push(track)
+      return { getTracks: () => [track] }
+    },
+    setTimeout: (fn, ms) => { const id = ledger.nextTimer++; ledger.timers.set(id, fn); return id },
+    clearTimeout: id => { ledger.timers.delete(id) },
+    now: () => Date.UTC(2026, 10, 7, 12, 0, 0)
+  }
+  return { env, ledger }
+}
+
+export function makeCtx (overrides = {}) {
+  const rests = []
+  const written = []
+  const ctx = {
+    rests,
+    written,
+    mint: async () => ({ url: 'wss://example.invalid/ws?access_token=auth_tokens/x', setup: { setup: { model: 'models/gemini-3.8-live' } } }),
+    rest: (path, opts) => { rests.push({ path, opts }); return path === '/session' ? ctx.mint(opts && opts.body) : Promise.resolve({ available: true, settings: { transcript_to_chat: 'chat_turn' } }) },
+    files: { writeText: async (folder, path, text) => { written.push({ folder, path, text }); return { ok: true } } },
+    ...overrides
+  }
+  return ctx
+}
+
+export const tick = () => new Promise(resolve => setImmediate(resolve))
+export async function settle (n = 5) { for (let i = 0; i < n; i++) await tick() }
