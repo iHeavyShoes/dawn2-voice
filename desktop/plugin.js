@@ -41,7 +41,7 @@ export const RECEIPT = 'WORK_STARTED: the whole request is in the open chat and 
 // the autonomous-lane rule): a reply that is one of these, or has one as its own first or last line,
 // or opens with a bracketed one, is not for the user and is never handed to the voice.
 export const SILENT_MARKERS = ['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默']
-export const TRANSCRIPT_HEADER = '[Voice call transcript (Gemini Live), saved for the record. No action needed; reply with one short line.]'
+export const TRANSCRIPT_HEADER = '[Voice call transcript (Gemini Live). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]'
 
 const WORKLET = `
 class GlcCapture extends AudioWorkletProcessor {

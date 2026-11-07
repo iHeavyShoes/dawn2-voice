@@ -1,4 +1,4 @@
-// node --test tests/js — delegation seam, barge-in, transcript and the stop path of desktop/plugin.js.
+// node --test 'tests/js/*.test.mjs' — delegation seam, barge-in, transcript and the stop path of desktop/plugin.js.
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeSdk, loadPlugin, makeEnv, makeCtx, settle } from './harness.mjs'
@@ -339,7 +339,8 @@ test('hang-up saves the transcript once to the open chat (queued turn) and to th
   assert.equal(saves[0].params.session_id, 'sess-1')
   assert.equal(saves[0].params.queued, true)
   assert.ok(!saves[0].params.surface, 'not a voice delegation')
-  assert.match(saves[0].params.text, /^\[Voice call transcript/)
+  assert.ok(saves[0].params.text.startsWith(P.TRANSCRIPT_HEADER + '\n\n'), 'the hang-up note heads the turn')
+  assert.equal(P.TRANSCRIPT_HEADER, '[Voice call transcript (Gemini Live). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]')
   assert.match(saves[0].params.text, /User: שלום, מה שלומך\?\nVoice: Hi there!/)
   assert.equal(ctx.written.length, 1)
   assert.equal(ctx.written[0].folder, 'data')
