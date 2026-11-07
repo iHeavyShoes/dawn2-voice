@@ -9,13 +9,20 @@ call is lost.
 - **Delegation lands in the open chat.** The voice model's `hermes_task` tool becomes
   `prompt.submit` on the chat that was focused when the call started (`surface: "voice-live"`, the
   same seam Hermes core's GPT-Live uses), with the recent spoken turns as `voice_context`. The request
-  and Hermes' full answer are ordinary rows in that chat. The voice reads a short version back.
+  and Hermes' full answer are ordinary rows in that chat. While the request is open the voice only
+  acknowledges it ("I'm checking"); it never answers first with content of its own.
+- **Hermes' answer is spoken in full.** The whole reply is made speakable (markdown, code blocks and
+  URLs removed; code and links are announced as "in the chat") and handed over in parts of about a
+  minute of speech, one per model turn, so a long explanation is read out instead of summarised.
+  Very long replies stop after about ten minutes and say the rest is in the chat. A reply that is
+  Hermes' silence sentinel (`[SILENT]`, `NO_REPLY`, as on Hermes' autonomous lanes) is not spoken.
 - **Transcript persisted.** At hang-up the whole spoken transcript is submitted once to the same
   chat as a queued turn (and also written to the plugin's own data folder). Configurable.
 - **Hebrew first, switch any time.** The voice starts in Hebrew (configurable) and answers in
   whichever language you spoke last.
 - **Barge-in.** Talk over the voice and it stops at once (Gemini's server VAD plus a local flush of
-  every queued audio buffer).
+  every queued audio buffer, also when the model has finished generating but audio is still
+  playing). Interrupting a long answer drops its remaining parts; they stay in the chat.
 - **Clean stop.** Hang-up, `end_call`, a dropped socket, disabling or hot-reloading the plugin all
   run one idempotent teardown that closes both sockets, stops every microphone track, closes both
   AudioContexts and clears timers. The backend holds no socket and starts no process, so there is
@@ -150,7 +157,10 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
   note to a chat, so `chat_turn` submits the transcript as a normal queued turn that Hermes
   acknowledges in one line (a small extra model call). Set `file` to avoid it.
 - **Results wait for a pause.** A Hermes reply is handed to the voice (`realtimeInput.text`) when it
-  next stops speaking, or after 4 s with no audio if a model turn never closes. Every assistant
+  next stops speaking and you are not talking, or after 4 s with no audio if a model turn never
+  closes. Parts of a long reply follow one per model turn (or after 8 s if a turn never closes).
+- **Faithful, not verbatim.** The voice model is told to speak the content completely and may
+  rephrase or translate it; it is a language model, so wording can differ from the chat. Every assistant
   reply on the pinned chat counts while the call is up, not only the reply to the delegation: an
   answer from a sub-agent that lands in a later turn ~20 s afterwards is spoken too, and interim
   assistant messages of a turn are included. `FunctionResponse.scheduling` is not used: Google's
@@ -166,8 +176,8 @@ is a property of the Hermes webapp build and has not been tested; see "Not verif
 
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
-python -m pytest -q                   # 21 tests: token minting, setup lock, key handling, routes
-node --test tests/js/                 # 22 tests: delegation seam, barge-in, transcript, stop path
+python -m pytest -q                   # 36 tests: token minting, setup lock, key handling, routes, persona
+node --test tests/js/                 # 37 tests: delegation seam, result hand-off, barge-in, transcript, stop path
 hermes plugins validate . --install-deps
 ```
 

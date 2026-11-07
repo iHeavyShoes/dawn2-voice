@@ -3,7 +3,7 @@
   "label": "Gemini Live",
   "description": "Single-use Gemini Live tokens for the Desktop voice call (the key stays on the server).",
   "icon": "MessageSquare",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "tab": { "path": "/gemini-live-chat", "hidden": true },
   "api": "plugin_api.py"
 }

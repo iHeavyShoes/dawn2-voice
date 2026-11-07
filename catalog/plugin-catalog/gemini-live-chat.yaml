@@ -9,7 +9,8 @@ description: >-
   Full-duplex Gemini Live voice for Hermes Desktop that hands every real request to Hermes as a
   normal turn in the chat you have open (prompt.submit, surface voice-live, the recent spoken turns
   as voice_context, the same seam as core GPT-Live), so nothing said on the call is lost. The
-  voice reads a short version of Hermes' answer back; the full answer stays in the chat. Barge-in,
+  voice only acknowledges while Hermes works, then speaks Hermes' whole answer, part by part,
+  with markdown, code and URLs removed; [SILENT] replies are not spoken. Barge-in,
   live language switching (starts in the configured language, follows the speaker), the spoken
   transcript saved to the chat at hang-up, and one idempotent stop path that closes both sockets,
   every mic track and both AudioContexts. The key never reaches the renderer: the backend mints a
@@ -22,7 +23,7 @@ description: >-
   queued turn in the open chat. No shell commands, background processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.2.0"
+version: "0.3.0"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"
