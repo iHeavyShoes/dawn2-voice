@@ -82,10 +82,42 @@ export function makeEnv () {
     connect () {}
     disconnect () {}
   }
+  // OpenAI Realtime (WebRTC) fakes: a peer connection with one data channel, and the SDP fetch.
+  ledger.peers = []
+  ledger.fetches = []
+  ledger.audios = []
+  ledger.sdpAnswer = { ok: true, status: 201, body: 'v=0 answer' }
+  class FakeDC {
+    constructor (label) { this.label = label; this.readyState = 'connecting'; this.sent = []; this.closed = false }
+    send (data) { if (this.readyState !== 'open') throw new Error('send on closed channel'); this.sent.push(JSON.parse(data)) }
+    close () { this.readyState = 'closed'; this.closed = true }
+    // test drivers
+    open () { this.readyState = 'open'; this.onopen && this.onopen() }
+    serve (msg) { this.onmessage && this.onmessage({ data: JSON.stringify(msg) }) }
+    drop () { this.readyState = 'closed'; this.onclose && this.onclose() }
+  }
+  class FakePC {
+    constructor () { this.tracks = []; this.closed = false; this.connectionState = 'new'; this.dc = null; this.remote = null; ledger.peers.push(this) }
+    addTrack (track) { this.tracks.push(track) }
+    createDataChannel (label) { this.dc = new FakeDC(label); return this.dc }
+    async createOffer () { return { type: 'offer', sdp: 'v=0 offer' } }
+    async setLocalDescription (d) { this.local = d }
+    async setRemoteDescription (d) { this.remote = d }
+    close () { this.closed = true; this.connectionState = 'closed' }
+    // test driver
+    fail () { this.connectionState = 'failed'; this.onconnectionstatechange && this.onconnectionstatechange() }
+  }
   const env = {
     WebSocket: FakeWS,
     AudioContext: FakeAudioContext,
     AudioWorkletNode: FakeWorkletNode,
+    RTCPeerConnection: FakePC,
+    fetch: async (url, opts) => {
+      ledger.fetches.push({ url, opts })
+      const a = ledger.sdpAnswer
+      return { ok: a.ok, status: a.status, text: async () => a.body }
+    },
+    createAudio: () => { const a = { paused: false, srcObject: null, play () { return Promise.resolve() }, pause () { this.paused = true } }; ledger.audios.push(a); return a },
     getUserMedia: async () => {
       ledger.micCalls += 1
       if (ledger.micGate) await ledger.micGate

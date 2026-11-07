@@ -272,11 +272,24 @@ test('stop while the microphone permission prompt is open releases the late stre
   assertAllReleased()
 })
 
-test('remote close tears the call down', async () => {
-  const { ws } = await liveCall()
+test('remote close tears the call down when no other provider can take over', async () => {
+  let n = 0
+  const ctx = makeCtx({ mint: async () => { if (n++) { const e = new Error('503'); e.detail = { reason: 'exhausted', message: 'No voice provider could start.' }; throw e } return { url: 'wss://x', setup: { setup: {} } } } })
+  const { ws } = await liveCall(ctx)
   ws.drop(1011, 'internal')
+  await settle()
   assertAllReleased()
   assert.match(P.call.detail, /1011/)
+  assert.match(P.call.detail, /No voice provider could start/)
+})
+
+test('a normal close (1000) ends the call without a provider switch', async () => {
+  const ctx = makeCtx()
+  const { ws } = await liveCall(ctx)
+  ws.drop(1000, '')
+  await settle()
+  assertAllReleased()
+  assert.equal(ctx.rests.filter(r => r.path === '/session').length, 1)
 })
 
 test('end_call: goodbye plays out, then the call hangs up on turnComplete', async () => {
@@ -313,7 +326,8 @@ test('goAway resumes on a new socket with the last handle and closes the old one
   ws.serve({ sessionResumptionUpdate: { newHandle: 'h-42', resumable: true } })
   ws.serve({ goAway: { timeLeft: '10s' } })
   await settle()
-  assert.deepEqual(ctx.rests.at(-1).opts.body, { resume_handle: 'h-42' })
+  // v0.4: a handle belongs to the key that issued it, so the resume is pinned to that provider
+  assert.deepEqual(ctx.rests.at(-1).opts.body, { resume_handle: 'h-42', provider: 'gemini-free' })
   const fresh = ledger.sockets.at(-1)
   assert.notEqual(fresh, ws)
   fresh.open()
@@ -340,7 +354,7 @@ test('hang-up saves the transcript once to the open chat (queued turn) and to th
   assert.equal(saves[0].params.queued, true)
   assert.ok(!saves[0].params.surface, 'not a voice delegation')
   assert.ok(saves[0].params.text.startsWith(P.TRANSCRIPT_HEADER + '\n\n'), 'the hang-up note heads the turn')
-  assert.equal(P.TRANSCRIPT_HEADER, '[Voice call transcript (Gemini Live). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]')
+  assert.equal(P.TRANSCRIPT_HEADER, '[Voice call transcript (live voice). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]')
   assert.match(saves[0].params.text, /User: שלום, מה שלומך\?\nVoice: Hi there!/)
   assert.equal(ctx.written.length, 1)
   assert.equal(ctx.written[0].folder, 'data')

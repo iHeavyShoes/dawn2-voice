@@ -1,9 +1,14 @@
-// gemini-live-chat — full-duplex Google Gemini Live voice in the Hermes Desktop composer.
+// gemini-live-chat — full-duplex live voice in the Hermes Desktop composer, on a provider chain:
+// Gemini Live (free key) -> OpenAI Realtime on the ChatGPT/Codex sign-in -> Gemini Live (paid key).
 //
 // Uncompiled ESM, one file: the loader resolves only @hermes/plugin-sdk and react, so every element
-// goes through createElement. The Gemini key never reaches this window: the backend half
-// (dashboard/plugin_api.py) mints a single-use ephemeral token whose setup (model, persona, tools,
-// voice) is locked server-side, and this file opens the Live socket with it.
+// goes through createElement. No credential ever reaches this window: the backend half
+// (dashboard/plugin_api.py) walks the chain and mints a short-lived session on the first provider
+// that can serve (a single-use Gemini token whose setup is locked server-side, or an OpenAI
+// ephemeral client secret Hermes core signed for). This file opens that provider's transport (a
+// WebSocket for Gemini, WebRTC for OpenAI); everything above the transport is shared (see
+// TRANSPORTS). When the serving provider fails mid-call, `failover` reconnects the same call to the
+// next provider with the recent spoken turns as context.
 //
 // Delegation (the point of this plugin): the voice model has one work tool, `hermes_task`. Each call
 // becomes a normal `prompt.submit` on the chat that was open when the call started, with
@@ -41,7 +46,7 @@ export const RECEIPT = 'WORK_STARTED: the whole request is in the open chat and 
 // the autonomous-lane rule): a reply that is one of these, or has one as its own first or last line,
 // or opens with a bracketed one, is not for the user and is never handed to the voice.
 export const SILENT_MARKERS = ['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默']
-export const TRANSCRIPT_HEADER = '[Voice call transcript (Gemini Live). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]'
+export const TRANSCRIPT_HEADER = '[Voice call transcript (live voice). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]'
 
 const WORKLET = `
 class GlcCapture extends AudioWorkletProcessor {
@@ -204,6 +209,9 @@ const defaultEnv = () => ({
   WebSocket: globalThis.WebSocket,
   AudioContext: globalThis.AudioContext,
   AudioWorkletNode: globalThis.AudioWorkletNode,
+  RTCPeerConnection: globalThis.RTCPeerConnection,
+  fetch: (...a) => globalThis.fetch(...a),
+  createAudio: () => new globalThis.Audio(),
   getUserMedia: c => globalThis.navigator.mediaDevices.getUserMedia(c),
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: id => globalThis.clearTimeout(id),
@@ -213,12 +221,12 @@ let env = null
 const E = () => env || (env = defaultEnv())
 export function setEnv (overrides) { env = { ...defaultEnv(), ...overrides } }
 
-// ── audio ────────────────────────────────────────────────────────────────────────────────────────
+const MIC_CONSTRAINTS = { audio: { channelCount: 1, autoGainControl: true, echoCancellation: true, noiseSuppression: true } }
+
+// ── audio (Gemini transport: PCM over the socket) ────────────────────────────────────────────────
 
 async function startMic (onFrame, isLive) {
-  const stream = await E().getUserMedia({
-    audio: { channelCount: 1, autoGainControl: true, echoCancellation: true, noiseSuppression: true }
-  })
+  const stream = await E().getUserMedia(MIC_CONSTRAINTS)
   if (!isLive()) { // the call was stopped while the permission prompt was open
     stream.getTracks().forEach(t => t.stop())
     return null
@@ -290,16 +298,50 @@ function createPlayer () {
   }
 }
 
+// ── providers and fallback (v0.4) ────────────────────────────────────────────────────────────────
+
+export const PROVIDER_LABELS = {
+  'gemini-free': 'Gemini (free key)',
+  'openai-codex': 'ChatGPT (Codex subscription)',
+  'gemini-paid': 'Gemini (paid key)'
+}
+export const MAX_SWITCHES = 3 // per call: at most once through the whole default chain
+export const COOLDOWN_MS = 15 * 60 * 1000 // a provider that refused for quota/auth is skipped this long
+// Handed to the new voice right after a mid-call switch (ahead of any queued result).
+export const SWITCH_NOTE = '[Voice provider switched] The call just moved to another voice provider because the previous one failed. Tell the user so in one short sentence in their language (for example "switching voice provider"), then continue where the conversation was. Do not greet again.'
+const OPENAI_ORIGIN = 'https://api.openai.com/'
+const cooldown = new Map() // provider id -> until (ms)
+export function cooledProviders () {
+  const now = E().now()
+  for (const [id, until] of cooldown) if (until <= now) cooldown.delete(id)
+  return [...cooldown.keys()]
+}
+export function resetCooldown () { cooldown.clear() }
+
+// Why a live connection failed, from a close reason / vendor error text and a close or HTTP code.
+// The words match the backend's REASONS (gemini_live_chat/providers.py).
+export function failureReason (text, code) {
+  const t = String(text || '').toLowerCase()
+  if (code === 429 || /quota|resource_exhausted|rate.?limit|usage limit|insufficient_quota/.test(t)) return 'quota'
+  if (code === 401 || code === 403 || /api key|api_key|unauthori[sz]ed|permission_denied|forbidden|invalid_api_key/.test(t)) return 'auth'
+  if (/expired/.test(t)) return 'expired'
+  if (code >= 500 && code < 600) return 'unavailable'
+  if (code === 1008 || code === 400) return 'rejected'
+  return 'network'
+}
+
 // ── the call (module scope: a composer row remounts on navigation, the call must not) ────────────
 
 export const call = {
-  state: 'idle', // idle | connecting | live | stopping
+  state: 'idle', // idle | connecting | live
   detail: '',
-  gen: 0, // bumped by every start and every stop; stale async work checks it and backs out
-  ws: null,
-  standby: null, // the replacement socket while resuming after goAway
-  stopMic: null,
-  player: null,
+  gen: 0, // bumped by every start, stop and provider switch; stale async work checks it and backs out
+  provider: null, // { id, label, transport, model } of the provider serving now
+  ws: null, // gemini-live: the Live socket
+  standby: null, // gemini-live: the replacement socket while resuming after goAway
+  stopMic: null, // gemini-live: releases the PCM microphone
+  player: null, // gemini-live: PCM playback
+  rtc: null, // openai-realtime: { pc, dc, stream, audio, open, speaking, responding, needResponse }
   sessionId: null,
   resumeHandle: null,
   modelSpeaking: false,
@@ -313,10 +355,15 @@ export const call = {
   speakingGroup: 0, // the reply whose part was handed last (barge-in drops its remaining parts)
   handing: false, // a part was handed and the model's turn for it has not completed yet
   handedAt: 0,
+  lastHanded: null, // the part handed last (re-handed when the provider fails before answering it)
   interim: [], // message.interim text of the Hermes turn in progress on the pinned chat
   turns: [], // [{ role: 'user'|'assistant', text }]
   partial: { user: '', assistant: '' },
   delegations: 0,
+  tried: [], // providers that failed on this call (never retried on it)
+  switches: 0,
+  switching: false,
+  providersUsed: [], // labels, in order, for the transcript
   settings: null,
   ctx: null,
   listeners: new Set()
@@ -327,6 +374,44 @@ function sendOn (ws, msg) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg))
 }
 const send = msg => sendOn(call.ws, msg)
+function rtcSend (msg) {
+  const dc = call.rtc && call.rtc.dc
+  if (dc && dc.readyState === 'open') dc.send(JSON.stringify(msg))
+}
+
+// ── transport abstraction ────────────────────────────────────────────────────────────────────────
+// Everything above the transports (delegation, result hand-off, barge-in bookkeeping, transcript,
+// hang-up) is shared; a transport only knows how to move text, tool answers and audio on its wire.
+
+const TRANSPORTS = {
+  'gemini-live': {
+    connected: () => !!call.ws,
+    playing: () => !!(call.player && call.player.playing()),
+    handText: text => send({ realtimeInput: { text } }),
+    answerTools: responses => send({ toolResponse: { functionResponses: responses } }),
+    stopPlayback: () => { call.player && call.player.flush() }
+  },
+  'openai-realtime': {
+    connected: () => !!(call.rtc && call.rtc.open),
+    playing: () => !!(call.rtc && call.rtc.speaking),
+    handText: text => {
+      rtcSend({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } })
+      rtcSend({ type: 'response.create' })
+      if (call.rtc) call.rtc.responding = true
+    },
+    answerTools: responses => {
+      for (const r of responses) {
+        const out = r.response && 'result' in r.response ? r.response.result : JSON.stringify(r.response || {})
+        rtcSend({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: r.id, output: String(out) } })
+        if (r.name !== 'end_call' && call.rtc) call.rtc.needResponse = true
+      }
+    },
+    // The server stops its own audio on barge-in (interrupt_response); this clears what is buffered.
+    stopPlayback: () => rtcSend({ type: 'output_audio_buffer.clear' })
+  }
+}
+const T = () => TRANSPORTS[(call.provider && call.provider.transport) || 'gemini-live']
+export const connected = () => T().connected()
 
 function remember (role, text) {
   const t = String(text || '').replace(/\s+/g, ' ').trim()
@@ -355,32 +440,28 @@ function detach (ws) {
   try { ws.close(1000, 'hang up') } catch { /* closed */ }
 }
 
-async function saveTranscript (ctx, sid, turns, mode) {
-  if (!turns.length || mode === 'off') return
-  const body = formatTranscript(turns)
-  const stamp = new Date(E().now()).toISOString().replace(/[:.]/g, '-')
-  if (ctx && ctx.files && typeof ctx.files.writeText === 'function') {
-    try { await ctx.files.writeText('data', `transcript-${stamp}.md`, `# Gemini Live call ${stamp}\n\n${body}\n`) } catch { /* best effort */ }
+function closeRealtime () {
+  const rtc = call.rtc
+  if (!rtc) return
+  call.rtc = null
+  if (rtc.dc) {
+    rtc.dc.onopen = rtc.dc.onmessage = rtc.dc.onclose = null
+    try { rtc.dc.close() } catch { /* closed */ }
   }
-  if (mode !== 'chat_turn' || !sid) return
-  try {
-    // A normal queued turn: if Hermes is still working on a delegation, it runs after it.
-    await host.request('prompt.submit', { session_id: sid, text: `${TRANSCRIPT_HEADER}\n\n${body}`, queued: true })
-  } catch (error) {
-    host.notify({ kind: 'warning', message: 'Could not save the call transcript to the chat', detail: String(error && error.message ? error.message : error) })
+  if (rtc.pc) {
+    rtc.pc.ontrack = rtc.pc.onconnectionstatechange = null
+    try { rtc.pc.close() } catch { /* closed */ }
+  }
+  if (rtc.stream) rtc.stream.getTracks().forEach(t => t.stop())
+  if (rtc.audio) {
+    try { rtc.audio.pause() } catch { /* not playing */ }
+    rtc.audio.srcObject = null
   }
 }
 
-// Idempotent. Releases every resource the call holds, synchronously: both sockets, the microphone
-// tracks and its AudioContext, the player, the hang-up timer. Nothing survives it.
-export function tearDown (note) {
-  const wasActive = call.state !== 'idle'
-  const ctx = call.ctx
-  const sid = call.sessionId
-  flushPartial('user')
-  flushPartial('assistant')
-  const turns = call.turns.slice()
-  call.gen += 1
+// Releases the provider connection and its audio, synchronously, and keeps the conversation
+// (turns, queue, open delegations, pinned chat): used by tearDown and by a provider switch.
+function releaseTransport () {
   const ws = call.ws
   const standby = call.standby
   call.ws = null
@@ -389,16 +470,49 @@ export function tearDown (note) {
   detach(standby)
   if (call.stopMic) { const stop = call.stopMic; call.stopMic = null; stop() }
   if (call.player) { call.player.close(); call.player = null }
-  if (call.hangTimer) { E().clearTimeout(call.hangTimer); call.hangTimer = null }
+  closeRealtime()
   if (call.flushTimer) { E().clearTimeout(call.flushTimer); call.flushTimer = null }
+  flushPartial('user')
+  flushPartial('assistant')
+  Object.assign(call, { modelSpeaking: false, resumeHandle: null, lastAudioAt: 0 })
+}
+
+async function saveTranscript (ctx, sid, turns, mode, used) {
+  if (!turns.length || mode === 'off') return
+  const via = used.length ? `Voice provider: ${used.join(' -> ')}\n\n` : ''
+  const body = formatTranscript(turns)
+  const stamp = new Date(E().now()).toISOString().replace(/[:.]/g, '-')
+  if (ctx && ctx.files && typeof ctx.files.writeText === 'function') {
+    try { await ctx.files.writeText('data', `transcript-${stamp}.md`, `# Live voice call ${stamp}\n\n${via}${body}\n`) } catch { /* best effort */ }
+  }
+  if (mode !== 'chat_turn' || !sid) return
+  try {
+    // A normal queued turn: if Hermes is still working on a delegation, it runs after it.
+    await host.request('prompt.submit', { session_id: sid, text: `${TRANSCRIPT_HEADER}\n\n${via}${body}`, queued: true })
+  } catch (error) {
+    host.notify({ kind: 'warning', message: 'Could not save the call transcript to the chat', detail: String(error && error.message ? error.message : error) })
+  }
+}
+
+// Idempotent. Releases every resource the call holds, synchronously: sockets, the peer connection,
+// the microphone tracks and its AudioContext, the player, the timers. Nothing survives it.
+export function tearDown (note) {
+  const wasActive = call.state !== 'idle'
+  const ctx = call.ctx
+  const sid = call.sessionId
+  call.gen += 1
+  releaseTransport()
+  const turns = call.turns.slice()
+  const used = call.providersUsed.slice()
+  if (call.hangTimer) { E().clearTimeout(call.hangTimer); call.hangTimer = null }
   Object.assign(call, {
-    state: 'idle', modelSpeaking: false, hangUp: false, queue: [], handing: false, handedAt: 0, interim: [], turns: [],
-    lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0,
-    partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null
+    state: 'idle', modelSpeaking: false, hangUp: false, queue: [], handing: false, handedAt: 0, lastHanded: null,
+    interim: [], turns: [], lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0, provider: null, switching: false,
+    partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null, tried: [], switches: 0, providersUsed: []
   })
   if (note !== undefined) call.detail = note
   publish()
-  if (wasActive) void saveTranscript(ctx, sid, turns, (call.settings && call.settings.transcript_to_chat) || 'chat_turn')
+  if (wasActive) void saveTranscript(ctx, sid, turns, (call.settings && call.settings.transcript_to_chat) || 'chat_turn', used)
 }
 
 // The model counts as quiet when the user is not talking, no handed part is still waiting for its
@@ -409,13 +523,14 @@ function modelQuiet () {
   const now = E().now()
   if (call.lastHeardAt && now - call.lastHeardAt < USER_QUIET_MS) return false
   if (call.handing && now - Math.max(call.handedAt, call.lastAudioAt) < AWAIT_MS) return false
+  if (call.rtc && call.rtc.responding && now - Math.max(call.handedAt, call.lastAudioAt) < AWAIT_MS) return false
   if (!call.modelSpeaking) return true
-  if (call.player && call.player.playing()) return false
+  if (T().playing()) return false
   return now - call.lastAudioAt >= STALL_MS
 }
 
 function armFlushRetry () {
-  if (call.flushTimer || !call.queue.length || !call.ws) return
+  if (call.flushTimer || !call.queue.length || !connected()) return
   call.flushTimer = E().setTimeout(() => { call.flushTimer = null; flushResults() }, FLUSH_RETRY_MS)
 }
 
@@ -429,21 +544,21 @@ export function enqueueResult (text) {
   return messages.length
 }
 
-// Hands over ONE queued message, only while the model is quiet; the next one follows on the
-// turnComplete of the model's answer to it, so the voice reads a long reply part by part instead of
-// summarising one big block (and a new part never cuts the previous one off).
+// Hands over ONE queued message, only while the model is quiet; the next one follows when the
+// model's answer to it completes, so the voice reads a long reply part by part instead of
+// summarising one big block (and a new part never cuts the previous one off). While a provider
+// switch is under way the queue simply waits for the next transport.
 export function flushResults () {
-  if (!call.queue.length || !call.ws) return
+  if (!call.queue.length || !connected()) return
   if (!modelQuiet()) { armFlushRetry(); return }
   const item = call.queue.shift()
   call.modelSpeaking = false
   call.handing = true
   call.handedAt = E().now()
+  call.lastHanded = item
   call.speakingGroup = item.group
-  // realtimeInput.text (the receipt already answered the function call, and a later turn's reply
-  // has no call to answer).
-  send({ realtimeInput: { text: item.text } })
-  armFlushRetry() // the next part normally follows on turnComplete; this covers a lost one
+  T().handText(item.text)
+  armFlushRetry() // the next part normally follows on turn completion; this covers a lost one
 }
 
 // Barge-in on a long answer: the rest of the reply being read is dropped (it stays in the chat).
@@ -451,6 +566,7 @@ function dropSpeakingRest () {
   if (!call.speakingGroup) return
   call.queue = call.queue.filter(i => i.group !== call.speakingGroup)
   call.speakingGroup = 0
+  call.lastHanded = null
 }
 
 export async function delegate (request) {
@@ -474,6 +590,7 @@ export async function delegate (request) {
   }
 }
 
+// calls: [{ id, name, args }] from either transport.
 function onToolCall (calls) {
   const responses = []
   for (const fc of calls || []) {
@@ -494,8 +611,34 @@ function onToolCall (calls) {
       responses.push({ id, name, response: { error: 'unknown tool' } })
     }
   }
-  if (responses.length) send({ toolResponse: { functionResponses: responses } })
+  if (responses.length) T().answerTools(responses)
 }
+
+// Barge-in bookkeeping shared by both transports (the audio itself is stopped by the transport).
+function onBargeIn () {
+  T().stopPlayback()
+  call.modelSpeaking = false
+  call.handing = false
+  dropSpeakingRest()
+  flushPartial('assistant')
+  armFlushRetry() // other replies wait until the user has finished (USER_QUIET_MS)
+}
+
+// The provider connection is ready: the call is live (again).
+function onReady () {
+  if (call.state !== 'connecting') return false
+  call.state = 'live'
+  if (call.switching) {
+    call.switching = false
+    call.detail = ''
+    call.queue.unshift({ text: SWITCH_NOTE, group: 0 })
+  }
+  publish()
+  flushResults()
+  return true
+}
+
+// ── gemini-live transport ────────────────────────────────────────────────────────────────────────
 
 function transcriptOf (msg, content, field) {
   const v = (content && content[field]) || msg[field]
@@ -511,20 +654,13 @@ export function receive (msg, ws) {
       call.standby = null
       detach(old)
     }
-    if (call.state === 'connecting') { call.state = 'live'; publish(); void attachMic() }
+    if (onReady()) void attachMic()
     return
   }
   if (ws !== call.ws) return // frames from a socket being replaced
   const content = msg.serverContent
   if (content) {
-    if (content.interrupted) { // barge-in: the server's VAD already stopped generation
-      call.player && call.player.flush()
-      call.modelSpeaking = false
-      call.handing = false
-      dropSpeakingRest()
-      flushPartial('assistant')
-      armFlushRetry() // other replies wait until the user has finished (USER_QUIET_MS)
-    }
+    if (content.interrupted) onBargeIn() // the server's VAD already stopped generation
     const parts = (content.modelTurn && content.modelTurn.parts) || []
     for (const part of parts) {
       const inline = part.inlineData
@@ -562,7 +698,13 @@ export function receive (msg, ws) {
     call.resumeHandle = String(msg.sessionResumptionUpdate.newHandle)
   }
   if (msg.goAway) void resume()
-  if (msg.error) { call.detail = String(msg.error.message || 'Gemini Live error'); publish() }
+  if (msg.error) {
+    const text = String(msg.error.message || 'Gemini Live error')
+    const reason = failureReason(text, msg.error.code)
+    if (reason === 'quota' || reason === 'auth') { void failover(reason, text); return }
+    call.detail = text
+    publish()
+  }
 }
 
 function decode (data) {
@@ -585,7 +727,12 @@ function openSocket (minted, gen) {
   ws.onclose = ev => {
     if (call.gen !== gen) return
     if (ws === call.standby) { call.standby = null; return } // resume failed; the old socket still runs until it dies
-    if (ws === call.ws) tearDown(call.detail || closeNote(ev))
+    if (ws !== call.ws) return
+    const note = call.detail || closeNote(ev)
+    // A normal close (1000) or a close after end_call ends the call; anything else (quota, auth,
+    // server error, network) moves the call to the next provider.
+    if (ev && ev.code !== 1000 && !call.hangUp) void failover(failureReason(ev.reason, ev.code), note)
+    else tearDown(note)
   }
   ws.onerror = () => {}
   return ws
@@ -605,10 +752,11 @@ async function resume () {
   const gen = call.gen
   if (!call.resumeHandle || call.standby || !ctx) return
   try {
-    const minted = await mint(ctx, { resume_handle: call.resumeHandle })
+    // A handle belongs to the key that issued it: resume on the same provider, never fall back.
+    const minted = await mint(ctx, { resume_handle: call.resumeHandle, provider: call.provider && call.provider.id })
     if (call.gen !== gen) return
     call.standby = openSocket(minted, gen)
-  } catch { /* the old socket keeps going until Google closes it */ }
+  } catch { /* the old socket keeps going until Google closes it, then the call fails over */ }
 }
 
 async function attachMic () {
@@ -624,6 +772,203 @@ async function attachMic () {
   } catch (error) {
     if (call.gen === gen) tearDown('Microphone unavailable: ' + (error && error.message ? error.message : String(error)))
   }
+}
+
+// ── openai-realtime transport (WebRTC; the Codex subscription route) ─────────────────────────────
+// The backend minted a short-lived client secret with Hermes' openai-codex sign-in; it is used once,
+// as the bearer of the SDP offer to api.openai.com, and never stored. Audio flows over the peer
+// connection, events over the "oai-events" data channel.
+
+async function openRealtime (minted, gen) {
+  const rtc = { pc: null, dc: null, stream: null, audio: null, open: false, speaking: false, responding: false, needResponse: false }
+  call.rtc = rtc
+  const current = () => call.gen === gen && call.rtc === rtc
+  if (typeof minted.offer_url !== 'string' || !minted.offer_url.startsWith(OPENAI_ORIGIN) || !minted.client_secret) {
+    void failover('rejected', 'Unexpected OpenAI session from the backend')
+    return
+  }
+  let stream
+  try {
+    stream = await E().getUserMedia(MIC_CONSTRAINTS)
+  } catch (error) {
+    if (current()) tearDown('Microphone unavailable: ' + (error && error.message ? error.message : String(error)))
+    return
+  }
+  if (!current()) { stream.getTracks().forEach(t => t.stop()); return } // stopped during the permission prompt
+  rtc.stream = stream
+  const pc = new (E().RTCPeerConnection)()
+  rtc.pc = pc
+  stream.getTracks().forEach(t => pc.addTrack(t, stream))
+  pc.ontrack = ev => {
+    if (!current()) return
+    const audio = E().createAudio()
+    audio.autoplay = true
+    audio.srcObject = (ev.streams && ev.streams[0]) || null
+    rtc.audio = audio
+    try { void Promise.resolve(audio.play && audio.play()).catch(() => {}) } catch { /* autoplay refused */ }
+  }
+  pc.onconnectionstatechange = () => {
+    if (current() && pc.connectionState === 'failed') void failover('network', 'The voice connection was lost')
+  }
+  const dc = pc.createDataChannel('oai-events')
+  rtc.dc = dc
+  dc.onopen = () => { if (current()) { rtc.open = true; onReady() } }
+  dc.onmessage = ({ data }) => {
+    if (!current()) return
+    let msg
+    try { msg = JSON.parse(decode(data)) } catch { return }
+    receiveRealtime(msg)
+  }
+  dc.onclose = () => {
+    if (!current()) return
+    if (call.hangUp) tearDown('')
+    else void failover('network', 'The voice connection closed')
+  }
+  try {
+    const offer = await pc.createOffer()
+    if (!current()) return
+    await pc.setLocalDescription(offer)
+    if (!current()) return
+    const res = await E().fetch(`${minted.offer_url}?model=${encodeURIComponent(minted.model || '')}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${minted.client_secret}`, 'Content-Type': 'application/sdp' },
+      body: offer.sdp
+    })
+    if (!current()) return
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      if (current()) void failover(failureReason(text, res.status), `OpenAI refused the call (${res.status})`)
+      return
+    }
+    const sdp = await res.text()
+    if (!current()) return
+    await pc.setRemoteDescription({ type: 'answer', sdp })
+  } catch (error) {
+    if (current()) void failover('network', 'Could not connect to OpenAI Realtime: ' + (error && error.message ? error.message : String(error)))
+  }
+}
+
+// OpenAI Realtime server events (GA names), mapped onto the shared call logic.
+export function receiveRealtime (msg) {
+  const rtc = call.rtc
+  if (!msg || typeof msg !== 'object' || !rtc) return
+  const now = E().now()
+  switch (msg.type) {
+    case 'input_audio_buffer.speech_started': // barge-in: the server already cut its response
+      call.lastHeardAt = now
+      if (call.modelSpeaking || call.handing) onBargeIn()
+      else flushPartial('assistant')
+      break
+    case 'conversation.item.input_audio_transcription.delta':
+      if (msg.delta) { call.lastHeardAt = now; flushPartial('assistant'); call.partial.user += msg.delta }
+      break
+    case 'conversation.item.input_audio_transcription.completed':
+      flushPartial('assistant')
+      if (typeof msg.transcript === 'string' && msg.transcript.trim()) call.partial.user = msg.transcript
+      flushPartial('user')
+      break
+    case 'response.created':
+      rtc.responding = true
+      break
+    case 'response.output_audio_transcript.delta':
+      if (msg.delta) { flushPartial('user'); call.partial.assistant += msg.delta }
+      break
+    case 'response.output_audio_transcript.done':
+      flushPartial('assistant')
+      break
+    case 'output_audio_buffer.started':
+      call.modelSpeaking = true
+      rtc.speaking = true
+      call.lastAudioAt = now
+      break
+    case 'output_audio_buffer.stopped':
+    case 'output_audio_buffer.cleared':
+      call.modelSpeaking = false
+      rtc.speaking = false
+      call.lastAudioAt = now
+      if (call.hangUp && !rtc.responding) { tearDown(''); return }
+      flushResults()
+      break
+    case 'response.function_call_arguments.done': {
+      let args = {}
+      try { args = JSON.parse(msg.arguments || '{}') } catch { /* no arguments */ }
+      onToolCall([{ id: msg.call_id, name: msg.name, args }])
+      break
+    }
+    case 'response.done':
+      flushPartial('user')
+      flushPartial('assistant')
+      rtc.responding = false
+      call.handing = false
+      if (call.hangUp) { if (!rtc.speaking) tearDown(''); return }
+      if (rtc.needResponse) { // a tool answer is in: let the voice acknowledge it
+        rtc.needResponse = false
+        rtcSend({ type: 'response.create' })
+        rtc.responding = true
+        return
+      }
+      flushResults()
+      break
+    case 'error': {
+      const e = msg.error || {}
+      const text = [e.code, e.type, e.message].filter(Boolean).join(' ')
+      const reason = failureReason(text)
+      if (reason === 'quota' || reason === 'auth' || reason === 'expired') { void failover(reason, `OpenAI Realtime: ${e.message || e.code}`); return }
+      rtc.responding = false
+      call.detail = String(e.message || e.code || 'OpenAI Realtime error').slice(0, 200)
+      publish()
+      break
+    }
+  }
+}
+
+// ── provider selection, start and mid-call failover ──────────────────────────────────────────────
+
+function openTransport (minted, gen) {
+  const id = minted.provider || 'gemini-free'
+  call.provider = {
+    id,
+    label: minted.provider_label || PROVIDER_LABELS[id] || id,
+    transport: minted.transport || 'gemini-live',
+    model: minted.model || ''
+  }
+  if (call.providersUsed.at(-1) !== call.provider.label) call.providersUsed.push(call.provider.label)
+  publish()
+  if (call.provider.transport === 'openai-realtime') {
+    void openRealtime(minted, gen)
+  } else {
+    call.player = createPlayer()
+    call.ws = openSocket(minted, gen)
+  }
+}
+
+// The serving provider failed (at connect or mid-call): release it, remember it, and reconnect the
+// SAME call to the next provider of the chain, carrying the recent spoken turns. A provider that
+// failed is never retried on this call; quota/auth refusals also cool it down for the next calls.
+export async function failover (reason, note) {
+  if (call.state === 'idle') return
+  const from = call.provider && call.provider.id
+  if (from) {
+    if (!call.tried.includes(from)) call.tried.push(from)
+    if (reason === 'quota' || reason === 'auth') cooldown.set(from, E().now() + COOLDOWN_MS)
+  }
+  if (call.hangUp || call.switches >= MAX_SWITCHES || !call.ctx) { tearDown(note); return }
+  call.gen += 1
+  const gen = call.gen
+  if (call.handing && call.lastHanded) call.queue.unshift(call.lastHanded) // never answered: hand it again
+  releaseTransport()
+  Object.assign(call, { state: 'connecting', switching: true, handing: false, switches: call.switches + 1, detail: 'Switching voice provider…' })
+  publish()
+  host.notify({ kind: 'info', message: `${(call.provider && call.provider.label) || 'The voice provider'} failed (${reason}); switching voice provider` })
+  let minted
+  try {
+    minted = await mint(call.ctx, { exclude: call.tried.slice(), carry: voiceContext(), switch_from: from, reason })
+  } catch (error) {
+    if (call.gen === gen) tearDown(`${note}. ${errorMessage(error, 'No other voice provider could start.')}`)
+    return
+  }
+  if (call.gen !== gen) return
+  openTransport(minted, gen)
 }
 
 function errorMessage (error, fallback) {
@@ -644,22 +989,31 @@ export async function start (ctx) {
   }
   call.gen += 1
   const gen = call.gen
-  Object.assign(call, { state: 'connecting', detail: '', turns: [], queue: [], handing: false, sessionId: sid, ctx })
+  Object.assign(call, {
+    state: 'connecting', detail: '', turns: [], queue: [], handing: false, sessionId: sid, ctx,
+    provider: null, tried: [], switches: 0, switching: false, providersUsed: []
+  })
   publish()
+  const cooled = cooledProviders()
   let minted
   try {
-    minted = await mint(ctx, {})
+    minted = await mint(ctx, cooled.length ? { exclude: cooled } : {})
   } catch (error) {
-    if (call.gen === gen) {
-      const message = errorMessage(error, 'Could not start Gemini Live')
+    if (call.gen !== gen) return
+    let failure = error
+    if (cooled.length) { // the cooldown is advice: when nothing else can serve, ask the providers again
+      try { minted = await mint(ctx, {}); failure = null } catch (again) { failure = again }
+      if (call.gen !== gen) return
+    }
+    if (failure) {
+      const message = errorMessage(failure, 'Could not start the voice call')
       tearDown(message)
       host.notify({ kind: 'warning', message })
+      return
     }
-    return
   }
-  if (call.gen !== gen) return // stopped while the token was minting: open nothing
-  call.player = createPlayer()
-  call.ws = openSocket(minted, gen)
+  if (call.gen !== gen) return // stopped while the session was minting: open nothing
+  openTransport(minted, gen)
 }
 
 // ── UI ───────────────────────────────────────────────────────────────────────────────────────────
@@ -673,23 +1027,30 @@ function useCall () {
   }, [])
 }
 
+const servingLabel = () => (call.provider && call.provider.label) || 'Voice'
+
+function chainText (status) {
+  const ready = ((status && status.providers) || []).filter(p => p.ready).map(p => p.label)
+  return ready.length ? ready.join(' -> ') : 'Gemini Live'
+}
+
 function VoiceButton ({ ctx }) {
   useCall()
   const [status, setStatus] = useState(null)
   useEffect(() => {
     let alive = true
     ctx.rest('/status').then(s => { if (alive) { setStatus(s); call.settings = s.settings } },
-      () => { if (alive) setStatus({ available: false, message: 'Gemini Live backend is off. Enable the gemini-live-chat plugin for this profile.' }) })
+      () => { if (alive) setStatus({ available: false, message: 'The voice backend is off. Enable the gemini-live-chat plugin for this profile.' }) })
     return () => { alive = false }
   }, [ctx])
   const live = call.state !== 'idle'
   const blocked = !live && status && !status.available
   const s = (status && status.settings) || {}
-  const model = s.model || 'gemini-3.8-live'
   const who = s.persona_name || 'Hermes'
-  const label = call.state === 'connecting' ? 'Connecting to Gemini Live'
-    : live ? (call.delegations ? `Gemini Live: ${who} is working (click to hang up)` : `Gemini Live: ${who} is listening (click to hang up)`)
-      : blocked ? status.message : (call.detail || `Talk with ${who} (Gemini Live, ${model}, voice ${s.voice || 'default'})`)
+  const label = call.state === 'connecting'
+    ? (call.switching ? 'Switching voice provider' : 'Connecting voice')
+    : live ? (call.delegations ? `${servingLabel()}: ${who} is working (click to hang up)` : `${servingLabel()}: ${who} is listening (click to hang up)`)
+      : blocked ? status.message : (call.detail || `Talk with ${who} (${chainText(status)})`)
   return h('button', {
     type: 'button',
     title: label,
@@ -702,17 +1063,22 @@ function VoiceButton ({ ctx }) {
   }, h(live ? icons.PhoneOff || icons.VolumeX : icons.AudioLines, { className: icons.iconSize.sm }))
 }
 
+// The status-bar chip always names the provider serving the call.
+export function chipText () {
+  if (call.state === 'idle') return ''
+  if (call.state === 'connecting') return call.switching ? 'Voice: switching provider' : 'Voice: connecting'
+  return call.delegations ? `${servingLabel()}: Hermes working (${call.delegations})` : `${servingLabel()}: on call`
+}
+
 function StatusChip () {
   useCall()
   if (call.state === 'idle') return null
-  const text = call.state === 'connecting' ? 'Gemini Live: connecting'
-    : call.delegations ? `Gemini Live: Hermes working (${call.delegations})` : 'Gemini Live: on call'
   return h('button', {
     type: 'button',
     title: 'Hang up',
     onClick: () => tearDown(''),
     className: 'px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)'
-  }, text)
+  }, chipText())
 }
 
 // Every assistant reply on the pinned chat is handed to the voice while the call is up — not only
@@ -721,7 +1087,8 @@ function StatusChip () {
 // queued follow-up, a reply to something typed mid-call); counting delegations dropped those.
 // Interim assistant text sealed during the turn (message.interim) is kept with the final text.
 // v0.3: the whole text is handed over (v0.2 kept only its last 3000 characters), in parts.
-const onPinnedChat = event => !!(event && call.ws && call.state === 'live' && event.session_id === call.sessionId)
+// v0.4: a reply that lands during a provider switch is queued and spoken by the next provider.
+const onPinnedChat = event => !!(event && call.state !== 'idle' && call.sessionId && event.session_id === call.sessionId)
 
 export function onMessageInterim (event) {
   if (!onPinnedChat(event)) return
@@ -753,12 +1120,12 @@ export function onMessageComplete (event) {
 
 export default {
   id: PLUGIN_ID,
-  name: 'Gemini Live',
+  name: 'Live voice (Gemini / ChatGPT)',
   defaultEnabled: false,
   register (ctx) {
     ctx.onEvent('message.complete', onMessageComplete)
     ctx.onEvent('message.interim', onMessageInterim)
-    // Disable / unload / hot-reload: hang up and release everything (mic, sockets, audio).
+    // Disable / unload / hot-reload: hang up and release everything (mic, sockets, peer, audio).
     ctx.onDispose(() => tearDown())
     ctx.register({ id: 'talk', area: 'composer.actions', order: 42, render: () => h(VoiceButton, { ctx }) })
     ctx.register({ id: 'status', area: 'statusBar.right', order: 140, render: () => h(StatusChip, {}) })
