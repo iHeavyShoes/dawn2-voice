@@ -54,6 +54,11 @@ NEW_SESSION_WINDOW_S = 60    # the token must open its session within this windo
 #: turn; Hermes acknowledges it). file: saved only to the plugin's data folder. off: neither.
 TRANSCRIPT_MODES = ("chat_turn", "file", "off")
 DEFAULT_TRANSCRIPT_MODE = "chat_turn"
+#: v0.6. hermes: the renderer sends every substantive user turn to Hermes and the voice model only
+#: speaks the text it is handed (no tools, relay persona). voice: v0.5 behaviour, where the voice
+#: model decides when to call hermes_task.
+BRAINS = ("hermes", "voice")
+DEFAULT_BRAIN = "hermes"
 
 #: Prebuilt voices of Google's native-audio / TTS models. The Live endpoint answers
 #: ``setupComplete`` to ANY voiceName and silently falls back to a default voice, so this list is
@@ -136,6 +141,7 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "transcript_to_chat": pick("transcript_to_chat", lambda v: v in TRANSCRIPT_MODES, DEFAULT_TRANSCRIPT_MODE),
         "half_duplex": raw.get("half_duplex") is True,
         "api_version": pick("api_version", lambda v: v in API_VERSIONS, DEFAULT_API_VERSION),
+        "brain": pick("brain", lambda v: v in BRAINS, DEFAULT_BRAIN),
         # v0.4: the provider chain (order of providers.PROVIDERS ids) and the OpenAI Realtime engine.
         "providers": _providers(raw.get("providers"), problems),
         "openai_model": str(pick("openai_model", _valid_openai_model, _OPENAI_DEFAULT_MODEL)).strip(),
@@ -243,6 +249,18 @@ def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None, carry:
     vocabulary = [t for t in [name, cfg.get("persona_name_he", "")] + list(cfg.get("vocabulary") or []) if t]
     if vocabulary:
         transcription["customVocabulary"] = list(dict.fromkeys(vocabulary))[:MAX_VOCABULARY]
+    relay = cfg.get("brain", DEFAULT_BRAIN) == "hermes"
+    if relay:
+        # brain: hermes. The voice only speaks "[Say aloud]" text: relay persona and no tools, so
+        # it cannot answer, delegate or hang up by itself. The carry-over is not needed: the
+        # renderer, not the voice, keeps the conversation.
+        system_text = persona.relay_instructions(
+            cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
+            name_he=cfg.get("persona_name_he", ""))
+    else:
+        system_text = persona.instructions(
+            cfg["language"], cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
+            voice=cfg["voice"], name_he=cfg.get("persona_name_he", ""), engine="gemini", carry=carry)
     setup: Dict[str, Any] = {
         "model": f"models/{cfg['model']}",
         "generationConfig": {
@@ -251,9 +269,7 @@ def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None, carry:
             # (the persona's language policy steers it), and the code would pin one language.
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": cfg["voice"]}}},
         },
-        "systemInstruction": {"parts": [{"text": persona.instructions(
-            cfg["language"], cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
-            voice=cfg["voice"], name_he=cfg.get("persona_name_he", ""), engine="gemini", carry=carry)}]},
+        "systemInstruction": {"parts": [{"text": system_text}]},
         "tools": [{"functionDeclarations": persona.tool_declarations(name)}],
         "realtimeInputConfig": {"automaticActivityDetection": {
             "silenceDurationMs": cfg["silence_ms"], "prefixPaddingMs": PREFIX_MS}},
@@ -263,6 +279,8 @@ def build_setup(cfg: Dict[str, Any], resume_handle: Optional[str] = None, carry:
         "contextWindowCompression": {"slidingWindow": {}},
         "sessionResumption": {"handle": resume_handle} if resume_handle else {},
     }
+    if relay:
+        del setup["tools"]
     if "extended-thinking" in cfg["model"]:
         # Required by that model (low/medium/high). gemini-3.8-live refuses the field.
         setup["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
@@ -377,6 +395,7 @@ def mint_session(key: Optional[str], cfg: Optional[Dict[str, Any]], resume_handl
         "model": cfg["model"],
         "voice": cfg["voice"],
         "persona_name": cfg["persona_name"],
+        "brain": cfg.get("brain", DEFAULT_BRAIN),
         "setup": {"setup": setup},
     }
 
@@ -388,5 +407,5 @@ def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg = resolve_persona(cfg)
     keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
             "persona_gender", "identity_source", "transcription_languages", "providers",
-            "openai_model", "openai_voice")
-    return {k: cfg[k] for k in keys}
+            "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he")
+    return {k: cfg[k] for k in keys if k in cfg}

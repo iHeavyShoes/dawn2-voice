@@ -45,7 +45,8 @@ class Codex:
 
 
 def cfg(**settings):
-    return live.resolve_persona(live.settings(settings or None))
+    # v0.5 contract (the voice model delegates) unless a test asks for brain="hermes".
+    return live.resolve_persona(live.settings({"brain": "voice", **settings}))
 
 
 def src(free=FREE_KEY, paid=PAID_KEY, gemini=None, codex=None):

@@ -5,13 +5,18 @@
 * ``POST /session`` -> the first provider of the chain that can serve:
   ``{provider, provider_label, transport, model, voice, attempts, ...transport fields}``.
   Body (all optional): ``{resume_handle, provider, exclude: [ids], carry, switch_from, reason}``.
+  The minted session carries ``brain`` (v0.6): ``hermes`` (default; the renderer delegates every
+  substantive turn, the voice only reads) or ``voice`` (v0.5: the voice model delegates).
 
   - ``provider`` + ``resume_handle``: Gemini session resumption on the provider that issued the
     handle (no fallback: a handle belongs to its key).
   - ``exclude``: providers the renderer already saw fail on this call, or that are cooling down
     after a quota/auth refusal; the chain skips them.
   - ``carry``: the recent spoken turns after a mid-call switch, put into the next provider's
-    instructions so it continues the conversation.
+    instructions so it continues the conversation (``brain: voice`` only).
+
+* ``POST /latency`` -> one log line per voice turn (milliseconds from end-of-speech to submit,
+  first Hermes text, first audio; ids, enums and integers only).
 
 Credentials never leave this side and are never returned or logged:
 
@@ -40,7 +45,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import live, openai_rt, prefs, providers  # noqa: E402
+from gemini_live_chat import latency, live, openai_rt, prefs, providers  # noqa: E402
 
 logger = logging.getLogger("gemini-live-chat")
 router = APIRouter()
@@ -215,6 +220,17 @@ def report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if ok:
         logger.info("gemini-live-chat: voice provider %s reported %s", body.get("provider"), body.get("reason"))
     return {"recorded": ok}
+
+
+@router.post("/latency")
+def latency_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One latency line per voice turn (milliseconds from the provider's end-of-speech; ids, enums
+    and integers only, no transcript or reply text), for before/after measurements in the log."""
+    rec = latency.clean(body)
+    if rec is None:
+        return {"ok": False}
+    logger.info("gemini-live-chat: %s", latency.line(rec))
+    return {"ok": True}
 
 
 @router.post("/session")

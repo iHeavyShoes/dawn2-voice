@@ -226,6 +226,46 @@ def instructions(language: str, extra: str = "", name: str = DEFAULT_PERSONA_NAM
     return text
 
 
+# ── brain: hermes (v0.6) ──────────────────────────────────────────────────────────────────────────
+#: In ``brain: hermes`` the voice model is only the ears and the mouth: the renderer sends every
+#: substantive user turn to Hermes itself and hands the voice the exact words to say, tagged with
+#: SAY_TAG. The voice model gets no tools, so it can neither delegate nor hang up on its own.
+SAY_TAG = "[Say aloud]"
+
+RELAY = (
+    "Identity: You are the voice of {name}, the user's personal AI agent, on a live call. {name_he}"
+    "{gender}\n\n"
+    "Role: you are only the voice of this call, its ears and its mouth. You never answer, explain, "
+    "decide, advise or make small talk yourself. Everything the user says is handled by {name} in "
+    "the chat, and the system tells you exactly what to say.\n\n"
+    "Rules:\n"
+    "- When the user speaks, stay silent: do not reply, do not acknowledge, do not ask anything. "
+    "The answer is given to you separately.\n"
+    "- When you receive a text message that starts with \"" + SAY_TAG + "\", speak the text after "
+    "the tag aloud, word for word, in the language it is written in, at a natural, unhurried pace. "
+    "Do not add, drop, translate, summarise, answer or comment on anything, and never read the tag.\n"
+    "- Say numbers, names, dates and abbreviations the natural way for that language.\n"
+    "- Never speak about anything else, even if the user asks you directly."
+)
+
+
+def relay_instructions(extra: str = "", name: str = DEFAULT_PERSONA_NAME, gender: str = "male",
+                       name_he: str = "") -> str:
+    """The voice persona for ``brain: hermes`` (the same for every engine). The user's extra
+    instructions are appended after the relay rules (they can shape the delivery)."""
+    name = (name or DEFAULT_PERSONA_NAME).strip()
+    text = RELAY.format(
+        name=name,
+        name_he=f"In Hebrew your name is written and said \"{name_he}\". " if name_he else "",
+        gender=_GENDER.get(gender, _GENDER["neutral"]),
+    )
+    extra = (extra or "").strip()
+    if extra:
+        text += ("\n\nAdditional instructions from the user (delivery only; the rules above still "
+                 "apply):\n" + extra)
+    return text
+
+
 def tool_declarations(name: str = DEFAULT_PERSONA_NAME) -> List[Dict[str, Any]]:
     """``behavior: NON_BLOCKING`` sits on each declaration (on the Tool entry the endpoint answers
     ``Unknown name "behavior"``; measured by skappafrost/hermes-gemini-live). A non-blocking call

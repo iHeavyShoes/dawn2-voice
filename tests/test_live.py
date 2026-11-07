@@ -11,6 +11,8 @@ from gemini_live_chat import live, persona
 
 FAKE_KEY = "AIzaFAKE-test-key-not-real-0000000000"
 NOW = dt.datetime(2026, 11, 7, 12, 0, 0, tzinfo=dt.timezone.utc)
+#: v0.5 behaviour (the voice model delegates with hermes_task); brain: hermes has its own tests.
+VOICE = {"brain": "voice"}
 
 
 class Recorder:
@@ -51,7 +53,7 @@ def test_token_is_single_use_short_lived_and_locks_the_whole_setup():
 
 
 def test_setup_frame_defaults():
-    setup = live.build_setup(live.settings(None))
+    setup = live.build_setup(live.settings(VOICE))
     assert setup["model"] == "models/gemini-3.8-live"
     assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
     # No persona configured anywhere: "Hermes", male by default, so a male prebuilt voice.
@@ -71,11 +73,11 @@ def test_setup_frame_defaults():
 
 
 def test_persona_is_hebrew_first_with_switching_and_result_tag():
-    text = live.build_setup(live.settings(None))["systemInstruction"]["parts"][0]["text"]
+    text = live.build_setup(live.settings(VOICE))["systemInstruction"]["parts"][0]["text"]
     assert "Start the conversation in Hebrew" in text
     assert "switch to English" in text
     assert persona.RESULT_TAG in text
-    en = live.build_setup(live.settings({"language": "en"}))["systemInstruction"]["parts"][0]["text"]
+    en = live.build_setup(live.settings({**VOICE, "language": "en"}))["systemInstruction"]["parts"][0]["text"]
     assert "Start the conversation in English" in en
 
 
@@ -143,7 +145,7 @@ def test_client_settings_carry_no_secret_and_no_instructions():
     out = live.client_settings(live.settings({"instructions": "be brief"}))
     assert set(out) == {"model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
                         "persona_gender", "identity_source", "transcription_languages", "providers",
-                        "openai_model", "openai_voice"}
+                        "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he"}
     assert "be brief" not in json.dumps(out)
     assert out["voice"] == "Charon"  # the effective voice, never "auto"
 
@@ -175,7 +177,7 @@ def test_identity_is_read_from_the_profile_soul():
 
 
 def test_voice_speaks_as_the_serving_agent_male_by_default():
-    cfg = live.resolve_persona(live.settings(None), RAY_SOUL)
+    cfg = live.resolve_persona(live.settings(VOICE), RAY_SOUL)
     assert (cfg["persona_name"], cfg["persona_name_he"], cfg["identity_source"]) == ("Ray", "ריי", "soul")
     assert cfg["persona_gender"] == "male" and cfg["voice"] == live.MALE_VOICE
     assert live.VOICE_GENDER[live.MALE_VOICE] == "male"
@@ -209,7 +211,7 @@ def test_bad_persona_settings_fall_back():
 
 
 def test_persona_forbids_invented_capabilities_and_actions():
-    text = _prompt(live.build_setup(live.resolve_persona(live.settings(None), RAY_SOUL)))
+    text = _prompt(live.build_setup(live.resolve_persona(live.settings(VOICE), RAY_SOUL)))
     assert "Never invent capabilities, limitations, settings or actions" in text
     assert "Never say you passed feedback" in text
     assert "say plainly that you do not know" in text
@@ -219,7 +221,7 @@ def test_persona_forbids_invented_capabilities_and_actions():
 
 
 def test_persona_does_not_nag_while_waiting():
-    text = _prompt(live.build_setup(live.settings(None)))
+    text = _prompt(live.build_setup(live.settings(VOICE)))
     assert "do not keep announcing that you are still waiting" in text
     assert "in a follow-up turn" in text
 
@@ -227,15 +229,15 @@ def test_persona_does_not_nag_while_waiting():
 # ── v0.3: delegate first, then speak Hermes' answer in full ─────────────────────────────────────
 
 def test_v03_knowledge_questions_and_side_requests_are_delegated():
-    text = _prompt(live.build_setup(live.settings(None)))
+    text = _prompt(live.build_setup(live.settings(VOICE)))
     assert "explain, describe or teach anything" in text and "even when you think you know the answer" in text
     assert "tell me a joke meanwhile\": both go to hermes_task" in text
-    desc = live.build_setup(live.settings(None))["tools"][0]["functionDeclarations"][0]["description"]
+    desc = live.build_setup(live.settings(VOICE))["tools"][0]["functionDeclarations"][0]["description"]
     assert "explanations" in desc and "Do not answer the request yourself meanwhile" in desc
 
 
 def test_v03_voice_only_acknowledges_while_a_request_is_open():
-    text = _prompt(live.build_setup(live.settings(None)))
+    text = _prompt(live.build_setup(live.settings(VOICE)))
     assert "Do not answer any part of it yourself: no explanation, fact, joke" in text
     assert "The user must hear one answer, the one from the chat" in text
     # present-tense acknowledgement, no promises (the "I'll pass your feedback to the team" line)
@@ -244,7 +246,7 @@ def test_v03_voice_only_acknowledges_while_a_request_is_open():
 
 
 def test_v03_results_are_spoken_faithfully_in_parts_never_as_placeholders():
-    text = _prompt(live.build_setup(live.settings(None)))
+    text = _prompt(live.build_setup(live.settings(VOICE)))
     assert "faithfully and completely" in text and "keep every point, step, name and number" in text
     assert "Never replace the content with a description of it" in text
     assert "\"(detailed explanation)\"" in text  # the placeholder it actually read on 2026-11-07
@@ -254,15 +256,15 @@ def test_v03_results_are_spoken_faithfully_in_parts_never_as_placeholders():
 
 
 def test_v03_prompt_has_no_broken_escapes():
-    text = _prompt(live.build_setup(live.settings(None)))
+    text = _prompt(live.build_setup(live.settings(VOICE)))
     assert '\\' not in text  # a doubled escape once left literal \" and stray quotes in the prompt
 
 
 # ── v0.2: Hebrew input transcription ────────────────────────────────────────────────────────────
 
 def test_transcription_language_hints_follow_the_starting_language():
-    assert live.settings(None)["transcription_languages"] == ["he", "en"]
-    assert live.settings({"language": "en"})["transcription_languages"] == ["en", "he"]
+    assert live.settings(VOICE)["transcription_languages"] == ["he", "en"]
+    assert live.settings({**VOICE, "language": "en"})["transcription_languages"] == ["en", "he"]
     assert live.settings({"language": "he-IL"})["transcription_languages"] == ["he-IL", "en"]
     assert live.settings({"language": "fr"})["transcription_languages"] == ["fr"]
     assert live.settings({"language": "auto"})["transcription_languages"] == []

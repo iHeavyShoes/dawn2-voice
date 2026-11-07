@@ -163,7 +163,9 @@ def test_status_and_session_speak_as_the_profile_agent(client, profile):
     assert r.status_code == 200
     out = r.json()
     assert out["persona_name"] == "Ray" and out["voice"] == "Charon"
-    assert "You are Ray" in out["setup"]["setup"]["systemInstruction"]["parts"][0]["text"]
+    # default brain: hermes, so the relay persona (still the profile agent's voice)
+    assert "You are the voice of Ray" in out["setup"]["setup"]["systemInstruction"]["parts"][0]["text"]
+    assert out["brain"] == "hermes" and "tools" not in out["setup"]["setup"]
     # only the name crosses the wire: the SOUL text itself never goes to Google
     assert "SECRET-SOUL-LINE" not in r.text and "SECRET-SOUL-LINE" not in json.dumps(client.calls)
 

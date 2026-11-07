@@ -105,6 +105,32 @@ def build_session(cfg: Dict[str, Any], carry: str = "") -> Dict[str, Any]:
     resolved (``live.resolve_persona``)."""
     name = cfg["persona_name"]
     voice = resolve_voice(cfg.get("openai_voice", AUTO), cfg["persona_gender"])
+    if cfg.get("brain", live.DEFAULT_BRAIN) == "hermes":
+        # brain: hermes. Server VAD still detects turns, transcribes, and cancels on barge-in, but
+        # never creates a response (create_response: false). The renderer creates every response
+        # itself, out of band, with only the text to speak as its input. No tools: the voice can
+        # neither delegate nor hang up by itself.
+        return {
+            "type": "realtime",
+            "model": cfg.get("openai_model") or DEFAULT_MODEL,
+            "instructions": persona.relay_instructions(
+                cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
+                name_he=cfg.get("persona_name_he", "")),
+            "audio": {
+                "input": {
+                    "noise_reduction": {"type": "near_field"},
+                    "transcription": {"model": TRANSCRIBE_MODEL, "prompt": _transcription_prompt(cfg)},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "silence_duration_ms": cfg["silence_ms"],
+                        "prefix_padding_ms": 300,
+                        "create_response": False,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {"voice": voice},
+            },
+        }
     return {
         "type": "realtime",
         "model": cfg.get("openai_model") or DEFAULT_MODEL,
@@ -200,4 +226,5 @@ def mint_session(post: Optional[Poster], cfg: Dict[str, Any], carry: str = "") -
         "model": session["model"],
         "voice": session["audio"]["output"]["voice"],
         "persona_name": cfg["persona_name"],
+        "brain": cfg.get("brain", live.DEFAULT_BRAIN),
     }

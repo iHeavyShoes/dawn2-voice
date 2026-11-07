@@ -109,7 +109,10 @@ def test_free_quota_falls_back_to_codex_signed_by_core(env, caplog):
     signed = env["signed"][0]
     assert (signed["provider"], signed["method"], signed["url"]) == (
         "openai-codex", "POST", "https://api.openai.com/v1/realtime/client_secrets")
-    assert signed["json"]["session"]["tools"][0]["name"] == "hermes_task"
+    # default brain: hermes: no tools, and the server never creates a response by itself
+    assert "tools" not in signed["json"]["session"]
+    assert signed["json"]["session"]["audio"]["input"]["turn_detection"]["create_response"] is False
+    assert out["brain"] == "hermes"
     assert "voice provider openai-codex serving (connect; model=gpt-realtime-2.1; skipped gemini-free:quota)" in caplog.text
     assert EK not in caplog.text and FREE not in caplog.text
 
@@ -121,7 +124,8 @@ def test_mid_call_switch_excludes_the_failed_provider_and_carries_context(env, c
         "carry": "User: book a table\nVoice: I'm checking."})
     out = r.json()
     assert out["provider"] == "openai-codex"
-    assert "User: book a table" in env["signed"][0]["json"]["session"]["instructions"]
+    # brain: hermes needs no carry-over (the renderer keeps the conversation; the voice only reads)
+    assert "User: book a table" not in env["signed"][0]["json"]["session"]["instructions"]
     assert env["google"] == []  # the failed provider is not asked again
     assert "switched from gemini-free after network" in caplog.text
 
