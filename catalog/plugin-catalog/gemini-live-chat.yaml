@@ -29,7 +29,7 @@ description: >-
   processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.4.0"
+version: "0.5.0"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"

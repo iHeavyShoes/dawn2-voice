@@ -228,6 +228,46 @@ retried around.
   (`Gemini (free key): on call`, `ChatGPT (Codex subscription): Hermes working (1)`), and show
   `Voice: switching provider` during a switch.
 
+### Choosing the provider (picker, v0.5)
+
+Next to the waveform button there is a small chevron; clicking it (or right-clicking the waveform
+button; a long-press on Android) opens **Voice provider**:
+
+| Option | What a call does |
+|---|---|
+| **Auto (fallback chain)** (default) | Walks the chain above (setting `providers`), with fallback. |
+| **Gemini (free key)** / **ChatGPT (Codex subscription)** / **Gemini (paid key)** | Uses only that provider. No fallback. If it cannot serve, the call ends; a local voice (the browser's speech synthesis, Hebrew when installed) and a toast say `<id> unavailable: <reason>`, and the toast's **Use Auto** button switches back to Auto. |
+
+Each row shows its state, both as a tooltip and written under the label (a phone has no hover):
+
+- green, *ready*: the key is present, or this Hermes can sign Codex requests. Whether you are
+  actually signed in to Codex is only known when a call asks, so a Codex sign-out shows after the
+  first refused call;
+- amber, *last attempt refused*: still clickable, because the refusal may be over (credit added,
+  signed in again); the text says why, for example `gemini-paid unavailable: no credit / billing`;
+  it clears as soon as that provider serves again;
+- grey, *not available*: no key / this Hermes is too old; not clickable; the text says what to add.
+
+The choice is stored per profile by the plugin's backend in the plugin's own data folder
+(`<HERMES_HOME>/plugin-data/gemini-live-chat/state.json`, through Hermes' plugin state API
+`hermes_cli.plugins_state.PluginState`), never in `config.yaml`. It therefore survives restarts and
+is the same on the Desktop app and on the phone. The routes: `GET /status` (adds `picker`),
+`POST /choice {"choice": "auto"|<provider id>}`, `POST /report {"provider", "reason"}` (a refusal
+the renderer saw on the provider's own connection; ids and enums only). A call in progress keeps
+the provider it started with; the picker is read-only until you hang up.
+
+### Paid Gemini key: billing
+
+`GEMINI_API_KEY_PAID` is a Google AI Studio key on a billed account. On **Prepay**, a $0 credit
+balance makes every key on that billing account fail with **HTTP 402 Payment Required** until
+credit is added (Google, ai.google.dev/gemini-api/docs/billing, checked 2026-11-07); a
+billing-disabled account can also answer 400/403, or 429 `RESOURCE_EXHAUSTED` with a billing
+message. The plugin maps 402, and any 400/403/429 whose body mentions billing, prepay or credit, to
+the reason `billing`, before the generic quota check. In Auto the chain moves on to the next
+provider; the picker then shows `gemini-paid unavailable: no credit / billing (add credit or billing
+in Google AI Studio)`. A 429 without billing words stays `quota`. Fix: add credit or billing in
+Google AI Studio; the next successful call clears the warning.
+
 **Catalog exception (documented).** The OpenAI route sends audio to `api.openai.com` on your
 ChatGPT subscription through a core-signed request; it needs `requires_auth`, and its realtime
 allowance is OpenAI's to set. That is outside the catalog's single-provider shape, which is fine
@@ -271,8 +311,11 @@ No DOM access, no `window.hermesDesktop`, no dynamic import, no core patches.
 The design has no Electron dependency: audio is `getUserMedia` + AudioWorklet + a browser
 WebSocket, and the webapp's CSP allows `connect-src wss:` and `blob:` workers. The microphone
 requires a **secure context**, so it works over `https://` (for example Tailscale HTTPS) or on
-`localhost`, not over plain `http://<lan-ip>`. Whether the webapp loads this desktop plugin at all
-is a property of the Hermes webapp build and has not been tested; see "Not verified".
+`localhost`, not over plain `http://<lan-ip>`. The Hermes docs state that the Webapp loads the
+desktop plugins installed on the host that serves it, so the button and the provider picker are
+there too; the picker uses only SDK components (`Popover`) and plugin routes, and writes each
+row's reason as text because a touchscreen has no hover tooltip. Not yet tried on a real phone.
+After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins** (or a page reload).
 
 ## Disclosure
 

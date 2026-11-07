@@ -1,5 +1,5 @@
 name: gemini-live-chat
-version: "0.4.0"
+version: "0.5.0"
 manifest_version: 1
 kind: standalone
 description: "Full-duplex live voice in Hermes Desktop that delegates every real request into the chat you have open (prompt.submit, surface voice-live, with the recent spoken turns as voice_context), so nothing said on the call is lost. Runs on a provider chain with automatic fallback, also mid-call: Gemini Live on a free key, then OpenAI Realtime on your ChatGPT/Codex sign-in, then Gemini Live on a paid key. Hebrew-first with live language switching, barge-in, transcript saved to the chat at hang-up, and a stop path that leaves no socket, peer connection, microphone or process behind. No credential reaches the renderer: it gets a single-use, setup-locked Gemini token or a short-lived OpenAI client secret that Hermes core signed for."
