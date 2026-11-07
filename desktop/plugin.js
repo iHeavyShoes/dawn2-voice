@@ -20,7 +20,7 @@
 //
 // Structure adapted from hermes-xai's voice module (MIT, Julien Talbot); Gemini Live wire facts from
 // hermes-gemini-live (MIT, Ha Trung). See README "Credits".
-import { host, icons } from '@hermes/plugin-sdk'
+import { host, icons, Popover, PopoverContent, PopoverTrigger } from '@hermes/plugin-sdk'
 import { createElement as h, useEffect, useState } from 'react'
 
 export const PLUGIN_ID = 'gemini-live-chat'
@@ -215,7 +215,26 @@ const defaultEnv = () => ({
   getUserMedia: c => globalThis.navigator.mediaDevices.getUserMedia(c),
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: id => globalThis.clearTimeout(id),
-  now: () => Date.now()
+  now: () => Date.now(),
+  // v0.5: the spoken notice when the chosen provider fails (its own voice is gone by then): the
+  // browser's local speech synthesis, nothing leaves the machine. False when unavailable.
+  speak: (text, lang) => {
+    const synth = globalThis.speechSynthesis
+    const Utterance = globalThis.SpeechSynthesisUtterance
+    if (!synth || !Utterance) return false
+    try {
+      const u = new Utterance(text)
+      u.lang = lang
+      const voice = synth.getVoices().find(v => String(v.lang || '').toLowerCase().startsWith(lang.slice(0, 2)))
+      if (voice) u.voice = voice
+      synth.cancel()
+      synth.speak(u)
+      return true
+    } catch { return false }
+  },
+  hasVoice: prefix => {
+    try { return (globalThis.speechSynthesis ? globalThis.speechSynthesis.getVoices() : []).some(v => String(v.lang || '').toLowerCase().startsWith(prefix)) } catch { return false }
+  }
 })
 let env = null
 const E = () => env || (env = defaultEnv())
@@ -318,10 +337,25 @@ export function cooledProviders () {
 }
 export function resetCooldown () { cooldown.clear() }
 
+// Refusals that cool a provider down for later calls, and that the backend remembers for the picker.
+const REFUSALS = ['quota', 'billing', 'auth']
+// The backend's REASONS wording (gemini_live_chat/providers.py _REASON_TEXT).
+export const REASON_TEXT = {
+  no_key: 'no key', not_signed_in: 'not signed in', unsupported: 'this Hermes is too old',
+  quota: 'quota or rate limit', billing: 'no credit / billing', auth: 'credential refused',
+  unavailable: 'service unavailable', unreachable: 'unreachable', rejected: 'request refused',
+  excluded: 'skipped on this call', network: 'connection lost', expired: 'session expired'
+}
+export const unavailableText = (id, reason) => `${id} unavailable: ${REASON_TEXT[reason] || reason || 'failed'}`
+// A paid Gemini key on a Prepay account with no credit: HTTP 402 Payment Required (Google AI
+// Studio billing docs), or a billing/credit text inside a 400/403/429 RESOURCE_EXHAUSTED.
+const BILLING_RE = /billing|prepa(y|id)|payment.required|credit.balance|insufficient.(credit|fund|balance)|out of credit|no credit/
+
 // Why a live connection failed, from a close reason / vendor error text and a close or HTTP code.
 // The words match the backend's REASONS (gemini_live_chat/providers.py).
 export function failureReason (text, code) {
   const t = String(text || '').toLowerCase()
+  if (code === 402 || BILLING_RE.test(t)) return 'billing'
   if (code === 429 || /quota|resource_exhausted|rate.?limit|usage limit|insufficient_quota/.test(t)) return 'quota'
   if (code === 401 || code === 403 || /api key|api_key|unauthori[sz]ed|permission_denied|forbidden|invalid_api_key/.test(t)) return 'auth'
   if (/expired/.test(t)) return 'expired'
@@ -364,6 +398,7 @@ export const call = {
   switches: 0,
   switching: false,
   providersUsed: [], // labels, in order, for the transcript
+  choice: 'auto', // v0.5: the picker choice this call started with ('auto' or one provider id)
   settings: null,
   ctx: null,
   listeners: new Set()
@@ -508,7 +543,8 @@ export function tearDown (note) {
   Object.assign(call, {
     state: 'idle', modelSpeaking: false, hangUp: false, queue: [], handing: false, handedAt: 0, lastHanded: null,
     interim: [], turns: [], lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0, provider: null, switching: false,
-    partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null, tried: [], switches: 0, providersUsed: []
+    partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null, tried: [], switches: 0, providersUsed: [],
+    choice: 'auto'
   })
   if (note !== undefined) call.detail = note
   publish()
@@ -701,7 +737,7 @@ export function receive (msg, ws) {
   if (msg.error) {
     const text = String(msg.error.message || 'Gemini Live error')
     const reason = failureReason(text, msg.error.code)
-    if (reason === 'quota' || reason === 'auth') { void failover(reason, text); return }
+    if (REFUSALS.includes(reason)) { void failover(reason, text); return }
     call.detail = text
     publish()
   }
@@ -913,7 +949,7 @@ export function receiveRealtime (msg) {
       const e = msg.error || {}
       const text = [e.code, e.type, e.message].filter(Boolean).join(' ')
       const reason = failureReason(text)
-      if (reason === 'quota' || reason === 'auth' || reason === 'expired') { void failover(reason, `OpenAI Realtime: ${e.message || e.code}`); return }
+      if (REFUSALS.includes(reason) || reason === 'expired') { void failover(reason, `OpenAI Realtime: ${e.message || e.code}`); return }
       rtc.responding = false
       call.detail = String(e.message || e.code || 'OpenAI Realtime error').slice(0, 200)
       publish()
@@ -942,15 +978,54 @@ function openTransport (minted, gen) {
   }
 }
 
+// v0.5: the chosen provider could not serve. Its own voice is gone, so the notice is spoken by the
+// browser's local speech synthesis (Hebrew when the call language is Hebrew and a Hebrew voice is
+// installed) and shown as a toast whose button switches the picker to Auto.
+export function pinnedNoticeText (id, reason, lang) {
+  const label = PROVIDER_LABELS[id] || id
+  if (String(lang || '').startsWith('he') && E().hasVoice('he')) {
+    const why = { billing: 'אין קרדיט או חיוב בחשבון', quota: 'נגמרה המכסה', auth: 'המפתח נדחה', not_signed_in: 'אין התחברות', no_key: 'חסר מפתח' }[reason] || 'הוא לא זמין'
+    return `ספק הקול ${label} לא זמין: ${why}. אפשר לעבור לאוטומטי בתפריט שליד כפתור השיחה.`
+  }
+  return `The voice provider ${label} is unavailable: ${REASON_TEXT[reason] || reason}. You can switch to Auto in the menu next to the call button.`
+}
+
+export function announcePinnedFailure (ctx, id, reason, message) {
+  const lang = (call.settings && call.settings.language) || 'he'
+  E().speak(pinnedNoticeText(id, reason, lang), String(lang).startsWith('he') && E().hasVoice('he') ? 'he-IL' : 'en-US')
+  host.notify({
+    kind: 'warning',
+    message: message || `${unavailableText(id, reason)}.`,
+    action: ctx ? { label: 'Use Auto', onClick: () => { void setChoice(ctx, 'auto') } } : undefined
+  })
+}
+
+// Tell the backend about a refusal it could not see (it happened on the provider's own socket), so
+// the picker shows it. Best effort; ids and enums only.
+function reportRefusal (ctx, provider, reason) {
+  if (!ctx || !provider || !(REFUSALS.includes(reason) || reason === 'not_signed_in')) return
+  try { void Promise.resolve(ctx.rest('/report', { method: 'POST', body: { provider, reason } })).catch(() => {}) } catch { /* best effort */ }
+}
+
 // The serving provider failed (at connect or mid-call): release it, remember it, and reconnect the
 // SAME call to the next provider of the chain, carrying the recent spoken turns. A provider that
-// failed is never retried on this call; quota/auth refusals also cool it down for the next calls.
+// failed is never retried on this call; quota/billing/auth refusals also cool it down for the next
+// calls. v0.5: when the user chose this one provider (not Auto), there is no next provider: the
+// call ends, the notice says why and offers Auto.
 export async function failover (reason, note) {
   if (call.state === 'idle') return
   const from = call.provider && call.provider.id
   if (from) {
     if (!call.tried.includes(from)) call.tried.push(from)
-    if (reason === 'quota' || reason === 'auth') cooldown.set(from, E().now() + COOLDOWN_MS)
+    if (REFUSALS.includes(reason)) cooldown.set(from, E().now() + COOLDOWN_MS)
+    reportRefusal(call.ctx, from, reason)
+  }
+  if (from && call.choice && call.choice !== 'auto' && !call.hangUp) {
+    const ctx = call.ctx
+    const text = `${unavailableText(from, reason)}. Switch the voice provider to Auto to use the fallback chain.`
+    tearDown(text)
+    announcePinnedFailure(ctx, from, reason, text)
+    return
   }
   if (call.hangUp || call.switches >= MAX_SWITCHES || !call.ctx) { tearDown(note); return }
   call.gen += 1
@@ -971,9 +1046,14 @@ export async function failover (reason, note) {
   openTransport(minted, gen)
 }
 
-function errorMessage (error, fallback) {
+function errorDetail (error) {
   const d = error && (error.detail || (error.body && error.body.detail))
-  if (d && typeof d === 'object' && d.message) return d.message
+  return d && typeof d === 'object' ? d : {}
+}
+
+function errorMessage (error, fallback) {
+  const d = errorDetail(error)
+  if (d.message) return d.message
   if (error && error.message) return error.message
   return fallback
 }
@@ -1001,18 +1081,28 @@ export async function start (ctx) {
   } catch (error) {
     if (call.gen !== gen) return
     let failure = error
-    if (cooled.length) { // the cooldown is advice: when nothing else can serve, ask the providers again
+    const pinned = errorDetail(error).reason === 'pinned_unavailable' // the backend ignores cooldowns for a pin
+    if (cooled.length && !pinned) { // the cooldown is advice: when nothing else can serve, ask the providers again
       try { minted = await mint(ctx, {}); failure = null } catch (again) { failure = again }
       if (call.gen !== gen) return
     }
     if (failure) {
+      const detail = errorDetail(failure)
       const message = errorMessage(failure, 'Could not start the voice call')
       tearDown(message)
-      host.notify({ kind: 'warning', message })
+      if (detail.reason === 'pinned_unavailable') {
+        const id = detail.choice
+        const reason = ((detail.attempts || []).find(a => a.provider === id) || {}).reason
+        announcePinnedFailure(ctx, id, reason, message)
+      } else {
+        host.notify({ kind: 'warning', message })
+      }
+      void refreshStatus(ctx) // the picker shows what just failed
       return
     }
   }
   if (call.gen !== gen) return // stopped while the session was minting: open nothing
+  call.choice = minted.choice || 'auto'
   openTransport(minted, gen)
 }
 
@@ -1034,33 +1124,159 @@ function chainText (status) {
   return ready.length ? ready.join(' -> ') : 'Gemini Live'
 }
 
+// ── provider picker (v0.5) ───────────────────────────────────────────────────────────────────────
+// The backend's /status (with `picker`) is shared by the button and the picker; the choice itself is
+// stored by the backend in the plugin's data folder (POST /choice), so it is the same on every
+// window and device connected to this Hermes, and survives restarts.
+
+export const ui = { status: null, open: false, saving: false }
+const OFFLINE = { available: false, message: 'The voice backend is off. Enable the gemini-live-chat plugin for this profile.' }
+
+export async function refreshStatus (ctx) {
+  try {
+    const s = await ctx.rest('/status')
+    ui.status = s
+    call.settings = s.settings
+  } catch {
+    ui.status = OFFLINE
+  }
+  publish()
+  return ui.status
+}
+
+// One click: store the choice, then show the fresh availability. Refused while a call is up (the
+// call keeps the provider it started with; the new choice applies to the next call).
+export async function setChoice (ctx, choice) {
+  if (ui.saving) return false
+  ui.saving = true
+  publish()
+  try {
+    const picker = await ctx.rest('/choice', { method: 'POST', body: { choice } })
+    if (ui.status && picker && picker.options) ui.status = { ...ui.status, picker }
+    await refreshStatus(ctx)
+    return true
+  } catch (error) {
+    host.notify({ kind: 'warning', message: errorMessage(error, 'Could not save the voice provider choice') })
+    return false
+  } finally {
+    ui.saving = false
+    publish()
+  }
+}
+
+export function choiceOf (status) {
+  return (status && status.picker && status.picker.choice) || 'auto'
+}
+
+const STATE_HINT = { ready: '', refused: ' (last attempt refused)', missing: ' (not available)' }
+
+// The rows of the picker: Auto, then each provider. A `missing` provider is greyed out and not
+// clickable; its tooltip says what is missing. A `refused` one stays clickable (the refusal may be
+// over: credit added, signed in again) and its tooltip says why it failed last time.
+export function pickerRows (status) {
+  const opts = (status && status.picker && status.picker.options) || []
+  return opts.map(o => ({
+    id: o.id,
+    label: o.id === 'auto' ? 'Auto (fallback chain)' : (o.label || PROVIDER_LABELS[o.id] || o.id),
+    selected: !!o.selected,
+    disabled: o.state === 'missing',
+    tone: o.state,
+    tooltip: o.detail || '',
+    note: STATE_HINT[o.state] || ''
+  }))
+}
+
+function PickerRow ({ ctx, row, busy }) {
+  const dot = row.tone === 'ready' ? 'bg-emerald-500' : row.tone === 'refused' ? 'bg-amber-500' : 'bg-muted-foreground/40'
+  return h('button', {
+    type: 'button',
+    role: 'menuitemradio',
+    'aria-checked': row.selected,
+    'aria-disabled': row.disabled || busy,
+    disabled: row.disabled || busy,
+    title: row.tooltip,
+    onClick: () => { if (!row.disabled && !row.selected) void setChoice(ctx, row.id) },
+    className: 'flex w-full items-start gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors ' +
+      (row.disabled ? 'cursor-not-allowed opacity-50 ' : 'hover:bg-muted ') + (row.selected ? 'bg-muted/60 ' : '')
+  },
+  h('span', { className: `mt-1.5 inline-block size-2 shrink-0 rounded-full ${dot}`, 'aria-hidden': true }),
+  h('span', { className: 'flex min-w-0 flex-1 flex-col' },
+    h('span', { className: 'font-medium' }, row.label, row.note ? h('span', { className: 'font-normal text-(--ui-text-tertiary)' }, row.note) : null),
+    // The reason is also written out, so it is readable on a phone, where there is no hover tooltip.
+    row.tooltip ? h('span', { className: 'text-[0.6875rem] leading-snug text-(--ui-text-tertiary) break-words' }, row.tooltip) : null),
+  row.selected ? h(icons.Check || 'span', { className: icons.iconSize.sm, 'aria-hidden': true }) : null)
+}
+
+function PickerPanel ({ ctx }) {
+  useCall()
+  const rows = pickerRows(ui.status)
+  const live = call.state !== 'idle'
+  const persistent = !(ui.status && ui.status.picker && ui.status.picker.persistent === false)
+  return h('div', { role: 'menu', 'aria-label': 'Voice provider', className: 'flex flex-col gap-0.5' },
+    h('div', { className: 'px-2 pb-1 pt-0.5 text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)' }, 'Voice provider'),
+    rows.length
+      ? rows.map(row => h(PickerRow, { key: row.id, ctx, row, busy: ui.saving || live }))
+      : h('div', { className: 'px-2 py-2 text-sm text-(--ui-text-tertiary)' }, (ui.status && ui.status.message) || 'Loading…'),
+    live ? h('div', { className: 'px-2 pt-1 text-[0.6875rem] text-(--ui-text-tertiary)' }, 'Hang up to change the provider; this call keeps its own.') : null,
+    persistent ? null : h('div', { className: 'px-2 pt-1 text-[0.6875rem] text-(--ui-text-tertiary)' }, 'This Hermes cannot store plugin state: the choice lasts until the gateway restarts.'))
+}
+
+function pickerSummary (status) {
+  const choice = choiceOf(status)
+  if (choice === 'auto') return 'Auto'
+  return PROVIDER_LABELS[choice] || choice
+}
+
+function ProviderPicker ({ ctx }) {
+  useCall()
+  const setOpen = v => {
+    ui.open = !!v
+    if (ui.open) void refreshStatus(ctx) // fresh availability every time it opens
+    publish()
+  }
+  const label = `Voice provider: ${pickerSummary(ui.status)}`
+  return h(Popover, { open: ui.open, onOpenChange: setOpen },
+    h(PopoverTrigger, { asChild: true },
+      h('button', {
+        type: 'button',
+        title: label,
+        'aria-label': label,
+        'aria-haspopup': 'menu',
+        'aria-expanded': ui.open,
+        // A finger-sized target on a phone; the chevron itself stays small.
+        className: 'inline-flex h-7 min-w-5 shrink-0 items-center justify-center rounded-full px-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
+      }, h(icons.ChevronDown || icons.ChevronUp || 'span', { className: 'size-3' }))),
+    h(PopoverContent, { side: 'top', align: 'end', className: 'w-72 p-1.5', 'aria-label': 'Voice provider' },
+      h(PickerPanel, { ctx })))
+}
+
 function VoiceButton ({ ctx }) {
   useCall()
-  const [status, setStatus] = useState(null)
-  useEffect(() => {
-    let alive = true
-    ctx.rest('/status').then(s => { if (alive) { setStatus(s); call.settings = s.settings } },
-      () => { if (alive) setStatus({ available: false, message: 'The voice backend is off. Enable the gemini-live-chat plugin for this profile.' }) })
-    return () => { alive = false }
-  }, [ctx])
+  useEffect(() => { void refreshStatus(ctx) }, [ctx])
+  const status = ui.status
   const live = call.state !== 'idle'
   const blocked = !live && status && !status.available
   const s = (status && status.settings) || {}
   const who = s.persona_name || 'Hermes'
+  const via = choiceOf(status) === 'auto' ? chainText(status) : `only ${pickerSummary(status)}`
   const label = call.state === 'connecting'
     ? (call.switching ? 'Switching voice provider' : 'Connecting voice')
     : live ? (call.delegations ? `${servingLabel()}: ${who} is working (click to hang up)` : `${servingLabel()}: ${who} is listening (click to hang up)`)
-      : blocked ? status.message : (call.detail || `Talk with ${who} (${chainText(status)})`)
-  return h('button', {
-    type: 'button',
-    title: label,
-    'aria-label': label,
-    'aria-pressed': live,
-    disabled: !!blocked,
-    onClick: () => (live ? tearDown('') : void start(ctx)),
-    className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-full transition-colors ' +
-      'hover:bg-muted disabled:opacity-50 ' + (live ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground')
-  }, h(live ? icons.PhoneOff || icons.VolumeX : icons.AudioLines, { className: icons.iconSize.sm }))
+      : blocked ? status.message : (call.detail || `Talk with ${who} (${via}). Right-click to choose the voice provider.`)
+  return h('span', { className: 'inline-flex shrink-0 items-center' },
+    h('button', {
+      type: 'button',
+      title: label,
+      'aria-label': label,
+      'aria-pressed': live,
+      disabled: !!blocked,
+      onClick: () => (live ? tearDown('') : void start(ctx)),
+      // Right-click (desktop) or long-press (Android Chrome fires contextmenu) opens the picker.
+      onContextMenu: ev => { if (ev && ev.preventDefault) ev.preventDefault(); ui.open = true; void refreshStatus(ctx); publish() },
+      className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-full transition-colors ' +
+        'hover:bg-muted disabled:opacity-50 ' + (live ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground')
+    }, h(live ? icons.PhoneOff || icons.VolumeX : icons.AudioLines, { className: icons.iconSize.sm })),
+    h(ProviderPicker, { ctx }))
 }
 
 // The status-bar chip always names the provider serving the call.

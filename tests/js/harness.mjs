@@ -21,14 +21,18 @@ export function makeSdk () {
       request: (method, params) => { requests.push({ method, params }); return sdk.requestImpl(method, params) },
       notify: n => { notes.push(n) }
     },
-    icons: { AudioLines: 'AudioLines', VolumeX: 'VolumeX', PhoneOff: 'PhoneOff', iconSize: { sm: 'sm' } }
+    icons: { AudioLines: 'AudioLines', VolumeX: 'VolumeX', PhoneOff: 'PhoneOff', ChevronDown: 'ChevronDown', Check: 'Check', iconSize: { sm: 'sm' } },
+    Popover: 'Popover',
+    PopoverContent: 'PopoverContent',
+    PopoverTrigger: 'PopoverTrigger'
   }
   return sdk
 }
 
 export async function loadPlugin (sdk) {
   const dir = mkdtempSync(join(tmpdir(), 'glc-'))
-  writeFileSync(join(dir, 'sdk.mjs'), 'export const host = globalThis.__glcSdk.host; export const icons = globalThis.__glcSdk.icons\n')
+  writeFileSync(join(dir, 'sdk.mjs'), 'export const host = globalThis.__glcSdk.host; export const icons = globalThis.__glcSdk.icons\n' +
+    'export const Popover = globalThis.__glcSdk.Popover; export const PopoverContent = globalThis.__glcSdk.PopoverContent; export const PopoverTrigger = globalThis.__glcSdk.PopoverTrigger\n')
   writeFileSync(join(dir, 'react.mjs'), 'export const createElement = (...a) => a; export const useEffect = () => {}; export const useState = v => [v, () => {}]\n')
   const src = readFileSync(PLUGIN, 'utf8')
     .replace("from '@hermes/plugin-sdk'", "from './sdk.mjs'")
@@ -84,6 +88,8 @@ export function makeEnv () {
   }
   // OpenAI Realtime (WebRTC) fakes: a peer connection with one data channel, and the SDP fetch.
   ledger.peers = []
+  ledger.spoken = []
+  ledger.voices = ['en-US']
   ledger.fetches = []
   ledger.audios = []
   ledger.sdpAnswer = { ok: true, status: 201, body: 'v=0 answer' }
@@ -127,7 +133,9 @@ export function makeEnv () {
     },
     setTimeout: (fn, ms) => { const id = ledger.nextTimer++; ledger.timers.set(id, fn); return id },
     clearTimeout: id => { ledger.timers.delete(id) },
-    now: () => Date.UTC(2026, 10, 7, 12, 0, 0)
+    now: () => Date.UTC(2026, 10, 7, 12, 0, 0),
+    speak: (text, lang) => { ledger.spoken.push({ text, lang }); return true },
+    hasVoice: prefix => ledger.voices.some(v => v.startsWith(prefix))
   }
   return { env, ledger }
 }
@@ -139,7 +147,15 @@ export function makeCtx (overrides = {}) {
     rests,
     written,
     mint: async () => ({ url: 'wss://example.invalid/ws?access_token=auth_tokens/x', setup: { setup: { model: 'models/gemini-3.8-live' } } }),
-    rest: (path, opts) => { rests.push({ path, opts }); return path === '/session' ? ctx.mint(opts && opts.body) : Promise.resolve({ available: true, settings: { transcript_to_chat: 'chat_turn' } }) },
+    status: () => ({ available: true, settings: { transcript_to_chat: 'chat_turn' } }),
+    choose: async body => ({ choice: body.choice, persistent: true, options: [] }),
+    rest: (path, opts) => {
+      rests.push({ path, opts })
+      if (path === '/session') return ctx.mint(opts && opts.body)
+      if (path === '/choice') return ctx.choose(opts && opts.body)
+      if (path === '/report') return Promise.resolve({ recorded: true })
+      return Promise.resolve(ctx.status())
+    },
     files: { writeText: async (folder, path, text) => { written.push({ folder, path, text }); return { ok: true } } },
     ...overrides
   }
