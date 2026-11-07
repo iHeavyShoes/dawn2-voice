@@ -38,4 +38,6 @@ jobs:
         with:
           node-version: "22"
       - name: Run node tests
-        run: node --test tests/js/
+        # Pass the files, not the directory: Node 22 runs a directory argument as a single test
+        # file (MODULE_NOT_FOUND); Node 23+ expands it. The quoted glob is expanded by node itself.
+        run: node --test 'tests/js/*.test.mjs'

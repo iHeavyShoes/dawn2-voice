@@ -1,4 +1,4 @@
-// node --test tests/js — v0.3 result hand-off: long replies are spoken in full (in parts), silent
+// node --test 'tests/js/*.test.mjs' — v0.3 result hand-off: long replies are spoken in full (in parts), silent
 // replies are never spoken, the receipt forbids the voice's own content, barge-in drops the rest.
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
