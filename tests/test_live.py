@@ -223,6 +223,40 @@ def test_persona_does_not_nag_while_waiting():
     assert "in a follow-up turn" in text
 
 
+# ── v0.3: delegate first, then speak Hermes' answer in full ─────────────────────────────────────
+
+def test_v03_knowledge_questions_and_side_requests_are_delegated():
+    text = _prompt(live.build_setup(live.settings(None)))
+    assert "explain, describe or teach anything" in text and "even when you think you know the answer" in text
+    assert "tell me a joke meanwhile\": both go to hermes_task" in text
+    desc = live.build_setup(live.settings(None))["tools"][0]["functionDeclarations"][0]["description"]
+    assert "explanations" in desc and "Do not answer the request yourself meanwhile" in desc
+
+
+def test_v03_voice_only_acknowledges_while_a_request_is_open():
+    text = _prompt(live.build_setup(live.settings(None)))
+    assert "Do not answer any part of it yourself: no explanation, fact, joke" in text
+    assert "The user must hear one answer, the one from the chat" in text
+    # present-tense acknowledgement, no promises (the "I'll pass your feedback to the team" line)
+    assert "present tense" in text and "Never promise a future action" in text
+    assert "Keep spoken answers short" not in text  # v0.2 line that licensed the summaries
+
+
+def test_v03_results_are_spoken_faithfully_in_parts_never_as_placeholders():
+    text = _prompt(live.build_setup(live.settings(None)))
+    assert "faithfully and completely" in text and "keep every point, step, name and number" in text
+    assert "Never replace the content with a description of it" in text
+    assert "\"(detailed explanation)\"" in text  # the placeholder it actually read on 2026-11-07
+    assert "[Hermes result 1/3]" in text and "Do not summarise or skip parts" in text
+    assert "A short result gets a short answer" in text
+    assert "[link in the chat]" in text and "[code: see the chat]" in text  # markers plugin.js emits
+
+
+def test_v03_prompt_has_no_broken_escapes():
+    text = _prompt(live.build_setup(live.settings(None)))
+    assert '\\' not in text  # a doubled escape once left literal \" and stray quotes in the prompt
+
+
 # ── v0.2: Hebrew input transcription ────────────────────────────────────────────────────────────
 
 def test_transcription_language_hints_follow_the_starting_language():
