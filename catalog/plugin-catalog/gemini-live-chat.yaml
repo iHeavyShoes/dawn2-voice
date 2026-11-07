@@ -1,0 +1,34 @@
+# DRAFT catalog entry for NousResearch/hermes-agent `plugin-catalog/gemini-live-chat.yaml`.
+# Before opening a PR: set `repo` to the public repository URL and `sha` to the full 40-character
+# commit you want reviewed, then run `hermes plugins validate <checkout> --install-deps` on that
+# commit. Drop these comment lines in the PR copy.
+name: gemini-live-chat
+repo: https://github.com/OWNER/gemini-live-chat
+sha: 0000000000000000000000000000000000000000
+description: >-
+  Full-duplex Gemini Live voice for Hermes Desktop that hands every real request to Hermes as a
+  normal turn in the chat you have open (prompt.submit, surface voice-live, the recent spoken turns
+  as voice_context, the same seam as core GPT-Live), so nothing said on the call is lost. The
+  voice reads a short version of Hermes' answer back; the full answer stays in the chat. Barge-in,
+  live language switching (starts in the configured language, follows the speaker), the spoken
+  transcript saved to the chat at hang-up, and one idempotent stop path that closes both sockets,
+  every mic track and both AudioContexts. The key never reaches the renderer: the backend mints a
+  single-use, setup-locked ephemeral token. Disclosure — pressing the call button captures
+  microphone audio and streams it from the renderer to generativelanguage.googleapis.com; the
+  backend calls the same host to mint the token with GEMINI_API_KEY (read through Hermes' secret
+  scope). Delegated requests, Hermes' answers (as text) and the recent spoken turns are sent to
+  Gemini. Call transcripts are written to the plugin's Desktop data folder and, by default, as one
+  queued turn in the open chat. No shell commands, background processes or telemetry.
+maintainer: OWNER
+tier: community
+version: "0.1.0"
+category: voice
+docs_url: https://github.com/OWNER/gemini-live-chat#readme
+requires_hermes: ">=0.21.5"
+platforms: []
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env:
+  - GEMINI_API_KEY
