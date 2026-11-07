@@ -87,6 +87,82 @@ test('Hermes reply (message.complete on that chat) is handed back as [Hermes res
   assert.equal(P.call.delegations, 0)
 })
 
+const handedTexts = ws => ws.sent.filter(m => m.realtimeInput && m.realtimeInput.text).map(m => m.realtimeInput.text)
+
+test('v0.2 receipt tells the model to say it once and not to keep announcing it is waiting', async () => {
+  const { ws } = await liveCall()
+  ws.serve(toolCall('hermes_task', { request: 'calendar tomorrow' }))
+  await settle()
+  const fr = ws.sent.find(m => m.toolResponse).toolResponse.functionResponses[0]
+  assert.equal(fr.response.result, P.RECEIPT)
+  assert.match(P.RECEIPT, /do not repeat that you are waiting/)
+  assert.ok(!('scheduling' in fr), 'unmeasured wire field stays out')
+})
+
+test('v0.2 late result: a LATER turn on the pinned chat (sub-agent finished) is still spoken', async () => {
+  const { ws } = await liveCall()
+  ws.serve(toolCall('hermes_task', { request: 'check my calendar tomorrow' }))
+  await settle()
+  // the delegated turn ends with a hand-off line…
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Asked a sub-agent to check the calendar.' } })
+  assert.equal(P.call.delegations, 0)
+  // …and the real answer arrives ~20 s later as a new turn on the same chat
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Tomorrow: dentist at 16:00.' } })
+  assert.deepEqual(handedTexts(ws), [
+    '[Hermes result] Asked a sub-agent to check the calendar.',
+    '[Hermes result] Tomorrow: dentist at 16:00.'
+  ])
+  // other chats still never reach the voice
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-OTHER', payload: { text: 'not ours' } })
+  assert.equal(handedTexts(ws).length, 2)
+})
+
+test('v0.2 interim assistant messages in the same turn are handed over with the final text', async () => {
+  const { ws } = await liveCall()
+  ws.serve(toolCall('hermes_task', { request: 'calendar' }))
+  await settle()
+  P.onMessageInterim({ type: 'message.interim', session_id: 'sess-1', payload: { text: 'You have 2 meetings tomorrow.' } })
+  P.onMessageInterim({ type: 'message.interim', session_id: 'sess-OTHER', payload: { text: 'nope' } })
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'The first is at 9.' } })
+  assert.deepEqual(handedTexts(ws), ['[Hermes result] You have 2 meetings tomorrow.\n\nThe first is at 9.'])
+  // an interim already contained in the final is not repeated
+  P.onMessageInterim({ type: 'message.interim', session_id: 'sess-1', payload: { text: 'Done.' } })
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Done. Booked.' } })
+  assert.equal(handedTexts(ws).at(-1), '[Hermes result] Done. Booked.')
+})
+
+test('v0.2 an empty turn nobody waits for is dropped; an empty delegated turn still reports', async () => {
+  const { ws } = await liveCall()
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: '' } })
+  assert.equal(handedTexts(ws).length, 0)
+  ws.serve(toolCall('hermes_task', { request: 'x' }))
+  await settle()
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: '', status: 'error', error: 'rate limited' } })
+  assert.deepEqual(handedTexts(ws), ['[Hermes result] Hermes stopped with an error: rate limited'])
+})
+
+test('v0.2 a model turn that never completes does not hold a result forever', async () => {
+  let t = Date.UTC(2026, 10, 7, 12, 0, 0)
+  P.setEnv({ ...env, now: () => t })
+  const { ws } = await liveCall()
+  ws.serve({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AAAA' } }] } } })
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Dentist at 4pm.' } })
+  assert.equal(handedTexts(ws).length, 0, 'held while the model speaks')
+  assert.equal(ledger.timers.size >= 1, true, 'a retry is armed')
+  // audio finished playing, no turnComplete, 5 s of silence: the retry delivers it
+  P.call.player.flush()
+  t += 5000
+  for (const [id, fn] of [...ledger.timers]) { ledger.timers.delete(id); fn() }
+  assert.deepEqual(handedTexts(ws), ['[Hermes result] Dentist at 4pm.'])
+})
+
+test('v0.2 results are not handed to a call that already hung up', async () => {
+  const { ws } = await liveCall()
+  P.tearDown()
+  P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'late' } })
+  assert.equal(handedTexts(ws).length, 0)
+})
+
 test('a failed prompt.submit is spoken back, not swallowed', async () => {
   sdk.requestImpl = async () => { throw new Error('session busy') }
   const { ws } = await liveCall()

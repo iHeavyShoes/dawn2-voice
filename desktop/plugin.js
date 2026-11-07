@@ -23,7 +23,12 @@ const IN_MIME = 'audio/pcm;rate=16000'
 export const CONTEXT_TURNS = 12
 const RESULT_LIMIT = 3000
 const HANGUP_GRACE_MS = 2500
+const STALL_MS = 4000 // an open model turn with no audio for this long no longer holds results back
+const FLUSH_RETRY_MS = 1000
 export const RESULT_TAG = '[Hermes result]'
+// The function call is answered at once (NON_BLOCKING) so the model keeps talking; the real result
+// follows as a "[Hermes result]" text input, from this turn or any later one on the pinned chat.
+export const RECEIPT = 'WORK_STARTED: the request is in the open chat and is being worked on. Say once, briefly, that you are on it; do not repeat that you are waiting. The answer arrives as a "[Hermes result]" message, possibly after a minute or more.'
 export const TRANSCRIPT_HEADER = '[Voice call transcript (Gemini Live), saved for the record. No action needed; reply with one short line.]'
 
 const WORKLET = `
@@ -190,7 +195,10 @@ export const call = {
   modelSpeaking: false,
   hangUp: false,
   hangTimer: null,
+  flushTimer: null,
+  lastAudioAt: 0,
   results: [],
+  interim: [], // message.interim text of the Hermes turn in progress on the pinned chat
   turns: [], // [{ role: 'user'|'assistant', text }]
   partial: { user: '', assistant: '' },
   delegations: 0,
@@ -267,8 +275,9 @@ export function tearDown (note) {
   if (call.stopMic) { const stop = call.stopMic; call.stopMic = null; stop() }
   if (call.player) { call.player.close(); call.player = null }
   if (call.hangTimer) { E().clearTimeout(call.hangTimer); call.hangTimer = null }
+  if (call.flushTimer) { E().clearTimeout(call.flushTimer); call.flushTimer = null }
   Object.assign(call, {
-    state: 'idle', modelSpeaking: false, hangUp: false, results: [], turns: [],
+    state: 'idle', modelSpeaking: false, hangUp: false, results: [], interim: [], turns: [], lastAudioAt: 0,
     partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null
   })
   if (note !== undefined) call.detail = note
@@ -276,12 +285,28 @@ export function tearDown (note) {
   if (wasActive) void saveTranscript(ctx, sid, turns, (call.settings && call.settings.transcript_to_chat) || 'chat_turn')
 }
 
-function flushResults () {
-  if (!call.results.length || !call.ws || call.modelSpeaking) return
+// The model counts as quiet when no turn is open, or when an open turn has sent no audio for
+// STALL_MS and nothing is still playing: a turn whose turnComplete never arrives (async reasoning,
+// a lost frame) must not hold a Hermes result back for the rest of the call.
+function modelQuiet () {
+  if (!call.modelSpeaking) return true
+  if (call.player && call.player.playing()) return false
+  return E().now() - call.lastAudioAt >= STALL_MS
+}
+
+function armFlushRetry () {
+  if (call.flushTimer || !call.results.length || !call.ws) return
+  call.flushTimer = E().setTimeout(() => { call.flushTimer = null; flushResults() }, FLUSH_RETRY_MS)
+}
+
+export function flushResults () {
+  if (!call.results.length || !call.ws) return
+  if (!modelQuiet()) { armFlushRetry(); return }
   const text = call.results.join('\n\n')
   call.results = []
-  // realtimeInput.text: Gemini Live has no scheduling knob on this endpoint, so the result is
-  // handed over only while the model is quiet.
+  call.modelSpeaking = false
+  // realtimeInput.text, handed over only while the model is quiet (the receipt already answered
+  // the function call, and a later turn's reply has no call to answer).
   send({ realtimeInput: { text: `${RESULT_TAG} ${text}` } })
 }
 
@@ -317,7 +342,9 @@ function onToolCall (calls) {
     if (name === 'hermes_task') {
       const request = String(args.request || '').trim()
       if (request) void delegate(request)
-      responses.push({ id, name, response: { result: request ? 'WORK_STARTED: Hermes is working on it in the open chat. Do not describe a result yet; it will arrive as a "[Hermes result]" message.' : 'No request text was given.' } })
+      // No FunctionResponse.scheduling: the docs disagree on where it goes (reference: top level;
+      // Live tools guide: inside `response`) and it was not measured against the live endpoint.
+      responses.push({ id, name, response: { result: request ? RECEIPT : 'No request text was given.' } })
     } else if (name === 'end_call') {
       call.hangUp = true
       responses.push({ id, name, response: { result: 'OK' } })
@@ -353,12 +380,14 @@ export function receive (msg, ws) {
       call.player && call.player.flush()
       call.modelSpeaking = false
       flushPartial('assistant')
+      flushResults()
     }
     const parts = (content.modelTurn && content.modelTurn.parts) || []
     for (const part of parts) {
       const inline = part.inlineData
       if (inline && inline.data) {
         call.modelSpeaking = true
+        call.lastAudioAt = E().now()
         call.player && call.player.play(b64ToPcm(inline.data))
       }
     }
@@ -501,10 +530,12 @@ function VoiceButton ({ ctx }) {
   }, [ctx])
   const live = call.state !== 'idle'
   const blocked = !live && status && !status.available
-  const model = status && status.settings ? status.settings.model : 'gemini-3.8-live'
+  const s = (status && status.settings) || {}
+  const model = s.model || 'gemini-3.8-live'
+  const who = s.persona_name || 'Hermes'
   const label = call.state === 'connecting' ? 'Connecting to Gemini Live'
-    : live ? (call.delegations ? 'Gemini Live: Hermes is working (click to hang up)' : 'Gemini Live: listening (click to hang up)')
-      : blocked ? status.message : (call.detail || `Talk with Gemini Live (${model})`)
+    : live ? (call.delegations ? `Gemini Live: ${who} is working (click to hang up)` : `Gemini Live: ${who} is listening (click to hang up)`)
+      : blocked ? status.message : (call.detail || `Talk with ${who} (Gemini Live, ${model}, voice ${s.voice || 'default'})`)
   return h('button', {
     type: 'button',
     title: label,
@@ -530,12 +561,40 @@ function StatusChip () {
   }, text)
 }
 
+// Every assistant reply on the pinned chat is handed to the voice while the call is up — not only
+// the reply to a counted delegation. A delegated turn often ends with "I've asked a sub-agent" and
+// the real answer arrives in a LATER turn on the same session (async delegation completion, a
+// queued follow-up, a reply to something typed mid-call); counting delegations dropped those.
+// Interim assistant text sealed during the turn (message.interim) is kept with the final text.
+const onPinnedChat = event => !!(event && call.ws && call.state === 'live' && event.session_id === call.sessionId)
+
+export function onMessageInterim (event) {
+  if (!onPinnedChat(event)) return
+  const text = textOf((event.payload || {}).text).replace(/\s+/g, ' ').trim()
+  if (text) call.interim.push(text)
+}
+
 export function onMessageComplete (event) {
-  if (!call.ws || !call.delegations || !event || event.session_id !== call.sessionId) return
-  call.delegations -= 1
+  if (!onPinnedChat(event)) return
   const payload = event.payload || {}
-  const text = textOf(payload.text).trim()
-  call.results.push(text ? text.slice(0, RESULT_LIMIT) : 'Hermes finished without a text answer.')
+  const final = textOf(payload.text).trim()
+  const interim = call.interim
+  call.interim = []
+  const flat = final.replace(/\s+/g, ' ')
+  const parts = interim.filter(t => !flat.includes(t))
+  if (final) parts.push(final)
+  const owed = call.delegations > 0
+  if (owed) call.delegations -= 1
+  if (parts.length) {
+    call.results.push(parts.join('\n\n').slice(-RESULT_LIMIT))
+  } else if (owed) {
+    call.results.push(payload.status === 'error' || payload.error
+      ? `Hermes stopped with an error: ${textOf(payload.error || payload.failure_reason || 'unknown').slice(0, 300)}`
+      : 'Hermes finished without a text answer.')
+  } else {
+    publish()
+    return // an empty turn nobody is waiting for (e.g. an interrupted queued turn)
+  }
   flushResults()
   publish()
 }
@@ -546,6 +605,7 @@ export default {
   defaultEnabled: false,
   register (ctx) {
     ctx.onEvent('message.complete', onMessageComplete)
+    ctx.onEvent('message.interim', onMessageInterim)
     // Disable / unload / hot-reload: hang up and release everything (mic, sockets, audio).
     ctx.onDispose(() => tearDown())
     ctx.register({ id: 'talk', area: 'composer.actions', order: 42, render: () => h(VoiceButton, { ctx }) })
