@@ -1,0 +1,29 @@
+name: gemini-live-chat
+version: "0.1.0"
+manifest_version: 1
+kind: standalone
+description: "Full-duplex Google Gemini Live voice in Hermes Desktop that delegates every real request into the chat you have open (prompt.submit, surface voice-live, with the recent spoken turns as voice_context), so nothing said on the call is lost. Hebrew-first with live language switching, barge-in, transcript saved to the chat at hang-up, and a stop path that leaves no socket, microphone or process behind. The Gemini key stays on the server: the renderer gets a single-use, setup-locked ephemeral token."
+author: "iHeavyShoes"
+license: MIT
+tags: ["voice", "gemini", "live", "desktop", "speech", "hebrew", "realtime"]
+requires_env:
+  - name: GEMINI_API_KEY
+    description: "Google AI Studio API key for the Gemini Live API"
+    url: "https://aistudio.google.com/apikey"
+    secret: true
+# 0.21.5 (v2026.9.24) is the first release with ctx.onEvent, composer.actions and the
+# `voice-live` prompt surface (voice_context) this plugin relies on.
+requires_hermes: ">=0.21.5"
+config_schema:
+  model: {type: str, default: "gemini-3.8-live", label: "Live model", description: "Gemini Live model id. gemini-3.8-live is the most reliable at delegating; -extended-thinking delegates far less often."}
+  voice: {type: str, default: "Aoede", label: "Voice", description: "A Gemini prebuilt voice name (Aoede, Kore, Puck, Charon, ...)"}
+  language: {type: str, default: "he", label: "Starting language", description: "he, en or auto. The voice follows whichever language you speak."}
+  silence_ms: {type: int, default: 1000, label: "End-of-turn silence (ms)", description: "400-5000"}
+  instructions: {type: str, default: "", label: "Extra instructions", description: "Appended to the voice persona"}
+  transcript_to_chat: {type: str, choices: ["chat_turn", "file", "off"], default: "chat_turn", label: "Save the call transcript", description: "chat_turn: one queued turn in the open chat at hang-up; file: plugin data folder only; off"}
+  half_duplex: {type: bool, default: false, label: "Half duplex", description: "Mute the mic while the voice speaks (for loudspeakers that defeat echo cancellation; disables barge-in)"}
+  api_version: {type: str, choices: ["v1alpha", "v1beta"], default: "v1alpha", label: "API version", description: "Live API version for ephemeral tokens"}
+provides_tools: []
+provides_hooks: []
+# No python_dependencies: the backend uses only the standard library plus FastAPI, which the
+# Hermes gateway already ships.
