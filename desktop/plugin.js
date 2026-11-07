@@ -9,7 +9,9 @@
 // becomes a normal `prompt.submit` on the chat that was open when the call started, with
 // surface 'voice-live' and the recent spoken turns as `voice_context` — the same seam Hermes core's
 // GPT-Live uses. The request and Hermes' answer are therefore ordinary rows in that chat. The turn's
-// `message.complete` text goes back to the voice as a "[Hermes result]" text input it says aloud.
+// `message.complete` text goes back to the voice as a "[Hermes result]" text input it says aloud:
+// the whole reply, made speakable (no markdown, code or URLs) and cut into parts the voice reads one
+// model turn at a time, so a long answer is spoken in full instead of being summarised away.
 //
 // Structure adapted from hermes-xai's voice module (MIT, Julien Talbot); Gemini Live wire facts from
 // hermes-gemini-live (MIT, Ha Trung). See README "Credits".
@@ -21,14 +23,24 @@ export const IN_RATE = 16000 // Gemini Live input: 16 kHz PCM16 mono
 export const OUT_RATE = 24000 // Gemini Live output: 24 kHz PCM16 mono
 const IN_MIME = 'audio/pcm;rate=16000'
 export const CONTEXT_TURNS = 12
-const RESULT_LIMIT = 3000
+export const PART_CHARS = 1200 // ~1 minute of speech per part; one part per model turn
+export const MAX_PARTS = 8 // ~10 minutes; anything longer is left in the chat, and the voice says so
+export const REST_IN_CHAT = '[The rest of this answer is only in the chat.]'
 const HANGUP_GRACE_MS = 2500
 const STALL_MS = 4000 // an open model turn with no audio for this long no longer holds results back
+const AWAIT_MS = 8000 // a handed part that gets no answer this long no longer holds the next one back
+const USER_QUIET_MS = 1200 // nothing is handed over while the user was heard this recently
 const FLUSH_RETRY_MS = 1000
 export const RESULT_TAG = '[Hermes result]'
 // The function call is answered at once (NON_BLOCKING) so the model keeps talking; the real result
 // follows as a "[Hermes result]" text input, from this turn or any later one on the pinned chat.
-export const RECEIPT = 'WORK_STARTED: the request is in the open chat and is being worked on. Say once, briefly, that you are on it; do not repeat that you are waiting. The answer arrives as a "[Hermes result]" message, possibly after a minute or more.'
+// v0.3: the receipt forbids any content of the voice's own while the request is open (it told its
+// own joke while Hermes wrote a different one) and asks for a present-tense acknowledgement only.
+export const RECEIPT = 'WORK_STARTED: the whole request is in the open chat and is being worked on. Acknowledge it once, in a few words and in the present tense (for example "I\'m checking"). Do not answer any part of it yourself: no joke, explanation, fact, guess or opinion of your own; the user must hear the answer from the chat. Do not repeat that you are waiting. The answer arrives as a "[Hermes result]" message, possibly after a minute or more; speak it in full then.'
+// Hermes' intentional-silence sentinels (gateway/response_filters.py LIVE_GATEWAY_SILENT_MARKERS,
+// the autonomous-lane rule): a reply that is one of these, or has one as its own first or last line,
+// or opens with a bracketed one, is not for the user and is never handed to the voice.
+export const SILENT_MARKERS = ['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默']
 export const TRANSCRIPT_HEADER = '[Voice call transcript (Gemini Live), saved for the record. No action needed; reply with one short line.]'
 
 const WORKLET = `
@@ -82,6 +94,104 @@ function textOf (value) {
   if (typeof value === 'string') return value
   if (value == null) return ''
   try { return JSON.stringify(value) } catch { return String(value) }
+}
+
+// ── result hand-off (v0.3, unit tested) ──────────────────────────────────────────────────────────
+
+const EDGE_PUNCT = /^[\s.,!?:;~*_`'"()。！？：；，、]+|[\s.,!?:;~*_`'"()。！？：；，、]+$/g
+const MARKER_FORMS = new Set(SILENT_MARKERS)
+
+function isMarker (line) {
+  const t = line.trim()
+  if (!t || t.length > 40) return false
+  const up = t.toUpperCase()
+  return MARKER_FORMS.has(up) || MARKER_FORMS.has(up.replace(EDGE_PUNCT, '')) ||
+    MARKER_FORMS.has(`[${up.replace(EDGE_PUNCT, '').replace(/^\[|\]$/g, '')}]`)
+}
+
+export function isSilent (text) {
+  const stripped = String(text || '').trim()
+  if (!stripped) return false
+  const upper = stripped.toUpperCase()
+  if (SILENT_MARKERS.some(m => m.startsWith('[') && upper.startsWith(m))) return true
+  const lines = stripped.split('\n').filter(l => l.trim())
+  return [stripped, lines[0], lines[lines.length - 1]].some(isMarker)
+}
+
+// Markdown to plain speakable text. Content is kept; only formatting goes. Code and URLs are not
+// read out character by character: a short marker tells the voice they are in the chat.
+export function speakable (text) {
+  let t = String(text || '').replace(/\r\n?/g, '\n')
+  t = t.replace(/```[\s\S]*?(```|$)/g, '\n[code: see the chat]\n')
+  t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+  t = t.replace(/\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)/g, '$1')
+  t = t.replace(/<?https?:\/\/[^\s>)]+>?/g, '[link in the chat]')
+  t = t.replace(/`([^`\n]+)`/g, '$1')
+  const lines = []
+  for (let line of t.split('\n')) {
+    if (/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line)) continue // table rule
+    if (/^\s*([-*_]\s*){3,}$/.test(line)) continue // horizontal rule
+    if (/^\s*\|.*\|\s*$/.test(line)) line = line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()).filter(Boolean).join(', ')
+    line = line.replace(/^\s{0,3}#{1,6}\s+/, '').replace(/^\s*>\s?/, '').replace(/^\s*[-*+•]\s+(\[[ xX]\]\s+)?/, '')
+    line = line.replace(/(\*\*|__)(.+?)\1/g, '$2').replace(/(^|[\s(])[*_]([^*_\n]+?)[*_](?=[\s).,!?:;]|$)/g, '$1$2')
+    lines.push(line.trim())
+  }
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function splitLong (piece, size) {
+  const out = []
+  let cur = ''
+  for (const s of piece.split(/(?<=[.!?。…])\s+/)) {
+    if (s.length > size) { // one huge sentence: cut at spaces
+      if (cur) { out.push(cur); cur = '' }
+      let rest = s
+      while (rest.length > size) {
+        let at = rest.lastIndexOf(' ', size)
+        if (at < size / 2) at = size
+        out.push(rest.slice(0, at).trim())
+        rest = rest.slice(at).trim()
+      }
+      cur = rest
+    } else if (cur && cur.length + 1 + s.length > size) {
+      out.push(cur)
+      cur = s
+    } else cur = cur ? `${cur} ${s}` : s
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
+// Parts of at most `size` characters, cut at paragraph, then sentence, then word boundaries.
+// Nothing is dropped: the parts together hold every word of the text, in order.
+export function splitParts (text, size = PART_CHARS) {
+  const parts = []
+  let cur = ''
+  for (const para of String(text || '').split(/\n{2,}/).map(p => p.trim()).filter(Boolean)) {
+    for (const piece of (para.length > size ? splitLong(para, size) : [para])) {
+      if (cur && cur.length + 2 + piece.length > size) {
+        parts.push(cur)
+        cur = piece
+      } else cur = cur ? `${cur}\n\n${piece}` : piece
+    }
+  }
+  if (cur) parts.push(cur)
+  return parts
+}
+
+// The realtimeInput.text messages for one Hermes reply: none for a silent reply, one
+// "[Hermes result] ..." for a short one, "[Hermes result k/n] ..." parts for a long one.
+export function resultMessages (text) {
+  if (isSilent(text)) return []
+  const body = speakable(text)
+  if (!body || isSilent(body)) return []
+  let parts = splitParts(body)
+  if (parts.length > MAX_PARTS) {
+    parts = parts.slice(0, MAX_PARTS)
+    parts[MAX_PARTS - 1] += `\n\n${REST_IN_CHAT}`
+  }
+  if (parts.length === 1) return [`${RESULT_TAG} ${parts[0]}`]
+  return parts.map((p, i) => `[Hermes result ${i + 1}/${parts.length}] ${p}`)
 }
 
 export function formatTranscript (turns) {
@@ -197,7 +307,12 @@ export const call = {
   hangTimer: null,
   flushTimer: null,
   lastAudioAt: 0,
-  results: [],
+  lastHeardAt: 0, // when the user's speech was last transcribed
+  queue: [], // [{ text, group }] result messages not yet handed to the voice, one per model turn
+  group: 0, // id of the last enqueued reply; every part of one reply shares it
+  speakingGroup: 0, // the reply whose part was handed last (barge-in drops its remaining parts)
+  handing: false, // a part was handed and the model's turn for it has not completed yet
+  handedAt: 0,
   interim: [], // message.interim text of the Hermes turn in progress on the pinned chat
   turns: [], // [{ role: 'user'|'assistant', text }]
   partial: { user: '', assistant: '' },
@@ -277,7 +392,8 @@ export function tearDown (note) {
   if (call.hangTimer) { E().clearTimeout(call.hangTimer); call.hangTimer = null }
   if (call.flushTimer) { E().clearTimeout(call.flushTimer); call.flushTimer = null }
   Object.assign(call, {
-    state: 'idle', modelSpeaking: false, hangUp: false, results: [], interim: [], turns: [], lastAudioAt: 0,
+    state: 'idle', modelSpeaking: false, hangUp: false, queue: [], handing: false, handedAt: 0, interim: [], turns: [],
+    lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0,
     partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null
   })
   if (note !== undefined) call.detail = note
@@ -285,36 +401,62 @@ export function tearDown (note) {
   if (wasActive) void saveTranscript(ctx, sid, turns, (call.settings && call.settings.transcript_to_chat) || 'chat_turn')
 }
 
-// The model counts as quiet when no turn is open, or when an open turn has sent no audio for
-// STALL_MS and nothing is still playing: a turn whose turnComplete never arrives (async reasoning,
-// a lost frame) must not hold a Hermes result back for the rest of the call.
+// The model counts as quiet when the user is not talking, no handed part is still waiting for its
+// answer (AWAIT_MS), and no turn is open, or an open turn has sent no audio for STALL_MS and nothing
+// is still playing: a turn whose turnComplete never arrives (async reasoning, a lost frame) must not
+// hold a Hermes result back for the rest of the call.
 function modelQuiet () {
+  const now = E().now()
+  if (call.lastHeardAt && now - call.lastHeardAt < USER_QUIET_MS) return false
+  if (call.handing && now - Math.max(call.handedAt, call.lastAudioAt) < AWAIT_MS) return false
   if (!call.modelSpeaking) return true
   if (call.player && call.player.playing()) return false
-  return E().now() - call.lastAudioAt >= STALL_MS
+  return now - call.lastAudioAt >= STALL_MS
 }
 
 function armFlushRetry () {
-  if (call.flushTimer || !call.results.length || !call.ws) return
+  if (call.flushTimer || !call.queue.length || !call.ws) return
   call.flushTimer = E().setTimeout(() => { call.flushTimer = null; flushResults() }, FLUSH_RETRY_MS)
 }
 
+// Queue one Hermes reply for the voice. Returns the number of messages queued (0: silent or empty).
+export function enqueueResult (text) {
+  const messages = resultMessages(text)
+  if (!messages.length) return 0
+  call.group += 1
+  for (const m of messages) call.queue.push({ text: m, group: call.group })
+  flushResults()
+  return messages.length
+}
+
+// Hands over ONE queued message, only while the model is quiet; the next one follows on the
+// turnComplete of the model's answer to it, so the voice reads a long reply part by part instead of
+// summarising one big block (and a new part never cuts the previous one off).
 export function flushResults () {
-  if (!call.results.length || !call.ws) return
+  if (!call.queue.length || !call.ws) return
   if (!modelQuiet()) { armFlushRetry(); return }
-  const text = call.results.join('\n\n')
-  call.results = []
+  const item = call.queue.shift()
   call.modelSpeaking = false
-  // realtimeInput.text, handed over only while the model is quiet (the receipt already answered
-  // the function call, and a later turn's reply has no call to answer).
-  send({ realtimeInput: { text: `${RESULT_TAG} ${text}` } })
+  call.handing = true
+  call.handedAt = E().now()
+  call.speakingGroup = item.group
+  // realtimeInput.text (the receipt already answered the function call, and a later turn's reply
+  // has no call to answer).
+  send({ realtimeInput: { text: item.text } })
+  armFlushRetry() // the next part normally follows on turnComplete; this covers a lost one
+}
+
+// Barge-in on a long answer: the rest of the reply being read is dropped (it stays in the chat).
+function dropSpeakingRest () {
+  if (!call.speakingGroup) return
+  call.queue = call.queue.filter(i => i.group !== call.speakingGroup)
+  call.speakingGroup = 0
 }
 
 export async function delegate (request) {
   const sid = call.sessionId
   if (!sid) {
-    call.results.push('No chat is open, so the request could not be handed to Hermes.')
-    flushResults()
+    enqueueResult('No chat is open, so the request could not be handed to Hermes.')
     return { ok: false }
   }
   call.delegations += 1
@@ -326,8 +468,7 @@ export async function delegate (request) {
     return { ok: true, status: res && res.status }
   } catch (error) {
     call.delegations = Math.max(0, call.delegations - 1)
-    call.results.push(`The request did not reach Hermes: ${error && error.message ? error.message : String(error)}`)
-    flushResults()
+    enqueueResult(`The request did not reach Hermes: ${error && error.message ? error.message : String(error)}`)
     publish()
     return { ok: false }
   }
@@ -379,8 +520,10 @@ export function receive (msg, ws) {
     if (content.interrupted) { // barge-in: the server's VAD already stopped generation
       call.player && call.player.flush()
       call.modelSpeaking = false
+      call.handing = false
+      dropSpeakingRest()
       flushPartial('assistant')
-      flushResults()
+      armFlushRetry() // other replies wait until the user has finished (USER_QUIET_MS)
     }
     const parts = (content.modelTurn && content.modelTurn.parts) || []
     for (const part of parts) {
@@ -393,13 +536,24 @@ export function receive (msg, ws) {
     }
   }
   const heard = transcriptOf(msg, content, 'inputTranscription')
-  if (heard) { flushPartial('assistant'); call.partial.user += heard }
+  if (heard) {
+    call.lastHeardAt = E().now()
+    // The server finishes generating long before playback ends; speech heard while buffered audio
+    // still plays gets no "interrupted" from the server, so it is stopped here.
+    if (!call.modelSpeaking && call.player && call.player.playing()) {
+      call.player.flush()
+      dropSpeakingRest()
+    }
+    flushPartial('assistant')
+    call.partial.user += heard
+  }
   const said = transcriptOf(msg, content, 'outputTranscription')
   if (said) { flushPartial('user'); call.partial.assistant += said }
   if (content && content.turnComplete) {
     flushPartial('user')
     flushPartial('assistant')
     call.modelSpeaking = false
+    call.handing = false
     if (call.hangUp) { tearDown(''); return }
     flushResults()
   }
@@ -490,7 +644,7 @@ export async function start (ctx) {
   }
   call.gen += 1
   const gen = call.gen
-  Object.assign(call, { state: 'connecting', detail: '', turns: [], results: [], sessionId: sid, ctx })
+  Object.assign(call, { state: 'connecting', detail: '', turns: [], queue: [], handing: false, sessionId: sid, ctx })
   publish()
   let minted
   try {
@@ -566,6 +720,7 @@ function StatusChip () {
 // the real answer arrives in a LATER turn on the same session (async delegation completion, a
 // queued follow-up, a reply to something typed mid-call); counting delegations dropped those.
 // Interim assistant text sealed during the turn (message.interim) is kept with the final text.
+// v0.3: the whole text is handed over (v0.2 kept only its last 3000 characters), in parts.
 const onPinnedChat = event => !!(event && call.ws && call.state === 'live' && event.session_id === call.sessionId)
 
 export function onMessageInterim (event) {
@@ -586,16 +741,13 @@ export function onMessageComplete (event) {
   const owed = call.delegations > 0
   if (owed) call.delegations -= 1
   if (parts.length) {
-    call.results.push(parts.join('\n\n').slice(-RESULT_LIMIT))
+    enqueueResult(parts.join('\n\n')) // a silent reply ([SILENT], NO_REPLY) queues nothing
   } else if (owed) {
-    call.results.push(payload.status === 'error' || payload.error
+    enqueueResult(payload.status === 'error' || payload.error
       ? `Hermes stopped with an error: ${textOf(payload.error || payload.failure_reason || 'unknown').slice(0, 300)}`
       : 'Hermes finished without a text answer.')
-  } else {
-    publish()
-    return // an empty turn nobody is waiting for (e.g. an interrupted queued turn)
   }
-  flushResults()
+  // else: an empty turn nobody is waiting for (e.g. an interrupted queued turn)
   publish()
 }
 

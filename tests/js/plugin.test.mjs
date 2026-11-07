@@ -95,7 +95,7 @@ test('v0.2 receipt tells the model to say it once and not to keep announcing it 
   await settle()
   const fr = ws.sent.find(m => m.toolResponse).toolResponse.functionResponses[0]
   assert.equal(fr.response.result, P.RECEIPT)
-  assert.match(P.RECEIPT, /do not repeat that you are waiting/)
+  assert.match(P.RECEIPT, /do not repeat that you are waiting/i)
   assert.ok(!('scheduling' in fr), 'unmeasured wire field stays out')
 })
 
@@ -106,6 +106,7 @@ test('v0.2 late result: a LATER turn on the pinned chat (sub-agent finished) is 
   // the delegated turn ends with a hand-off line…
   P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Asked a sub-agent to check the calendar.' } })
   assert.equal(P.call.delegations, 0)
+  ws.serve({ serverContent: { turnComplete: true } }) // the voice said it
   // …and the real answer arrives ~20 s later as a new turn on the same chat
   P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Tomorrow: dentist at 16:00.' } })
   assert.deepEqual(handedTexts(ws), [
@@ -125,6 +126,7 @@ test('v0.2 interim assistant messages in the same turn are handed over with the 
   P.onMessageInterim({ type: 'message.interim', session_id: 'sess-OTHER', payload: { text: 'nope' } })
   P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'The first is at 9.' } })
   assert.deepEqual(handedTexts(ws), ['[Hermes result] You have 2 meetings tomorrow.\n\nThe first is at 9.'])
+  ws.serve({ serverContent: { turnComplete: true } })
   // an interim already contained in the final is not repeated
   P.onMessageInterim({ type: 'message.interim', session_id: 'sess-1', payload: { text: 'Done.' } })
   P.onMessageComplete({ type: 'message.complete', session_id: 'sess-1', payload: { text: 'Done. Booked.' } })
