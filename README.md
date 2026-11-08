@@ -21,8 +21,10 @@ call is lost.
   Hermes' silence sentinel (`[SILENT]`, `NO_REPLY`, as on Hermes' autonomous lanes) is not spoken.
 - **Transcript persisted and checked.** At hang-up the whole spoken transcript is submitted once to
   the same chat as a queued turn (and also written to the plugin's own data folder). Configurable.
-  The turn asks Hermes to check the call for any request that was not delegated or not answered in
-  the chat and to tell you or handle it; if nothing was missed it replies with one short line.
+  The turn asks Hermes to check the call for any request that was not delegated or answered in
+  the chat, and for any voice bug, and to report only problems. Otherwise it does not comment on
+  the call: a hang-up is often just to save live quota, so it continues the conversation in text
+  from where the call left off (the last open point or next step), in one or two lines.
 - **Hebrew first, switch any time.** The voice starts in Hebrew (configurable) and answers in
   whichever language you spoke last.
 - **Barge-in.** Talk over the voice and it stops at once (the provider's server VAD plus a local flush of
@@ -328,8 +330,27 @@ already read: every sentence not yet read is read, and none is read twice (the f
 guarantee). A silent reply (`[SILENT]`, `NO_REPLY`) is never read. Long replies are capped as
 before, ending with "the rest is in the chat".
 
-**Ack.** If Hermes has not produced its first sentence 900 ms after the turn was submitted, the voice
-says "בודק." / "Checking." once. On a fast answer, nothing is said before it.
+**Ack (v0.8).** If Hermes has not produced its first sentence 900 ms after the turn was submitted, the
+voice says one short acknowledgement, like a person would ("רגע", "שנייה, בוא נראה", "הממ, רגע",
+"Hmm, let me see"). On a fast answer (first sentence within 900 ms) nothing is said before it.
+
+*How it is made (design choice).* The ack is picked **locally in the renderer** from a phrase bank
+(`ACK_BANK`, 29 Hebrew and 28 English phrases); the voice model never writes it, so it cannot
+answer, guess or promise. A model-written ack was rejected: even a "≤8 words, never answer" prompt
+leaks content now and then, and the guard would then have to drop it after the fact.
+
+- About one turn in three (`ACK_ECHO_ODDS`, never twice in a row) the ack echoes 1–3 words copied
+  from the user's own transcript ("אה, ביומן מחר, שנייה."); the topic is rule-based (`ackTopic`: the
+  first content words, skipping question/request words, pronouns, the persona's name and digits).
+- Silence is a valid ack: on a short turn that asks for no work (likely fast) it is sometimes skipped.
+- Never the same phrase within the last 5 acks; "good question" only after a question; Hebrew forms
+  follow `persona_gender`; the bare "בודק" is rare (low weight), not the default.
+- A guard (`verifyAck`) drops any ack longer than 8 words or with a word that is neither the bank's
+  nor the user's own, so no new fact, number, time or name can be spoken.
+
+**Speaker labels (v0.8).** A leading `<persona>:` label on a line of Hermes' reply ("ריי: כן, זה
+אפשרי", `**Ray:**`, also `Hermes:`) is stripped before the text reaches the voice, and a piece that
+is only the persona's name ("ריי") is not read. A colon elsewhere ("השעה: 10") is untouched.
 
 **Barge-in and corrections.** Speech during a reply stops playback, and what is left of that reply
 is held for up to 2.5 s until the user's words are known. A backchannel ("ok", "כן") or noise
@@ -348,7 +369,7 @@ note is the only hint. The model is not changed.
 that answers in about 0.5 s. Baseline before streaming (agent.log, prompt received → reply ready,
 `voice-live` turns, measured by Ray): about 3–7 s for simple turns, about 12 s with a short tool
 check, about 46 s with longer tool work. Streaming moves first audio to "first sentence written +
-voice TTS start". The target is about 2–3 s after the user stops on simple questions; the "checking"
+voice TTS start". The target is about 2–3 s after the user stops on simple questions; the short
 ack covers anything slower. Greetings, acks, "repeat" and "stop" stay local and instant. If you
 prefer speed over always getting the chat model's answer, set `brain: voice`.
 
@@ -376,8 +397,9 @@ a plugin would open two voice sessions on one microphone. Instead, with core's w
 the plugin's backend runs the same engine core uses (`tools.wake_word`, sherpa-onnx
 open-vocabulary keyword spotting: any English phrase, no training, local, offline):
 
-1. Each window calls `POST /wake/arm` once; the detector starts if `wake_word` is on (the first
-   start lazy-installs `wake-sherpa` and downloads the ~13 MB model, like core's own first use).
+1. The gateway arms the detector itself when it mounts the plugin's routes (v0.8), and each window
+   calls `POST /wake/arm` at load; the detector starts if `wake_word` is on (the first start
+   lazy-installs `wake-sherpa` and downloads the ~13 MB model, like core's own first use).
 2. On the phrase the detector **releases the microphone first**, then sends
    `plugin.gemini-live-chat.wake.detected {token}` to every window.
 3. The first eligible window to `POST /wake/claim` the token starts the call (the open chat, as
@@ -451,6 +473,21 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
   queued turn per call in the open chat (unless `transcript_to_chat` says otherwise).
 - No shell commands, no background processes, no telemetry, no self-update.
 
+### Issue log
+
+- **v0.8.0 (2026-11-08): "Hey Ray" stopped working after a gateway restart** until the Desktop
+  plugins were rescanned. Cause: the detector lives in the gateway process and was armed only by
+  the renderer, once, at plugin load; a restart killed the detector and the still-loaded window
+  never armed it again (agent.log: routes mounted after the restart, no "wake word listening" line).
+  Fix, both sides: (1) the backend arms on its own when the gateway imports the route module
+  (background thread), with a lazy fallback on the first `/status` or `/wake` request (e.g. under
+  `plugins.isolation: host`). It runs once per process, only with `wake_word` on, never while core's
+  own wake word is on (one mic lease; it reports an error instead), and leaves an armed or paused
+  detector alone. (2) The renderer re-arms when the SDK's `host.state.gateway` socket state goes
+  back to `open`, and every 45 s while idle it reads `GET /wake` and calls `/wake/arm` if the state
+  is not listening, arming or paused. Neither runs during a call or while a wake is being claimed.
+  A wake-word error is shown once, not on every check.
+
 ## Limitations
 
 - **The transcript note is a turn.** The Desktop SDK has no supported way to append a non-turn
@@ -476,8 +513,8 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
 
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
-python -m pytest -q                   # 85 tests: token/secret minting, chain, fallback reasons, routes, logs, persona
-node --test 'tests/js/*.test.mjs'     # 56 tests: delegation seam, hand-off, barge-in, transcript, stop path, both transports, mid-call switch
+python -m pytest -q                   # 151 tests: minting, chain, fallback, routes, persona, wake word, restart
+node --test 'tests/js/*.test.mjs'     # 124 tests: delegation, hand-off, barge-in, transcript, transports, wake, ack, labels
 hermes plugins validate . --install-deps
 ```
 
