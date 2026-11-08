@@ -33,7 +33,7 @@ export async function loadPlugin (sdk) {
   const dir = mkdtempSync(join(tmpdir(), 'glc-'))
   writeFileSync(join(dir, 'sdk.mjs'), 'export const host = globalThis.__glcSdk.host; export const icons = globalThis.__glcSdk.icons\n' +
     'export const Popover = globalThis.__glcSdk.Popover; export const PopoverContent = globalThis.__glcSdk.PopoverContent; export const PopoverTrigger = globalThis.__glcSdk.PopoverTrigger\n')
-  writeFileSync(join(dir, 'react.mjs'), 'export const createElement = (...a) => a; export const useEffect = () => {}; export const useState = v => [v, () => {}]\n')
+  writeFileSync(join(dir, 'react.mjs'), 'export const createElement = (...a) => a; export const useEffect = () => {}; export const useState = v => [typeof v === \'function\' ? v() : v, () => {}]; export const useRef = v => ({ current: v ?? null })\n')
   const src = readFileSync(PLUGIN, 'utf8')
     .replace("from '@hermes/plugin-sdk'", "from './sdk.mjs'")
     .replace("from 'react'", "from './react.mjs'")

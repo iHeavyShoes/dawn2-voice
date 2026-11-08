@@ -48,7 +48,10 @@ test('picker opens with all providers refused and exposes a direct error recover
   const picker = pickerElement[0](pickerElement[1])
   const trigger = picker[2]
   assert.equal(trigger[1].asChild, undefined, 'the SDK renders its own button: no nested button')
+  // Radix's trigger toggles through onOpenChange; the plugin's own onClick must not toggle too.
   trigger[1].onClick()
+  assert.equal(P.ui.open, false, 'no second toggle of our own')
+  picker[1].onOpenChange(true)
   assert.equal(P.ui.open, true)
   P.ui.open = false
   await P.start(ctx)

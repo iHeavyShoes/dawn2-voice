@@ -502,6 +502,20 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
 
 ### Issue log
 
+- **v0.9.1: the provider picker never opened in Hermes Desktop** (chevron or right-click); it
+  worked in the phone webapp. Cause: Desktop keeps a composer mounted for every kept-alive chat
+  tab and split pane (hidden ones under `data-pane-hidden` / `inert`), so the composer action, and
+  with it the picker's Radix Popover, exists several times. All of them read one shared `open`
+  flag, so one click opened every copy; each `PopoverContent` took focus, focus in one was
+  "outside" the others, and Radix's dismissable layer called `onOpenChange(false)` on both in the
+  same tick. The webapp mounts one composer, so nothing competed there. Reproduced with React
+  19.3 + `radix-ui` 1.7.0 (Desktop's versions) in jsdom: 1 composer opens, 2 or more close at once,
+  for both the chevron and the right-click. Fix: each voice button is its own picker instance and
+  only the owner renders open (a notification action opens the one in the visible pane); the
+  extra `onClick` toggle next to Radix's own trigger toggle is gone. An opt-in diagnostic
+  (`debug_picker`, or an empty `debug-picker.on` in the plugin data folder) writes
+  `picker-debug.jsonl` with event names, counts and booleans only. Real Desktop acceptance is
+  Ray's.
 - **v0.9.0: previous/first-sentence readout repeated.** Two reproducible client defects: terminal
   `response_reused` was treated as a fresh answer after the stream was destroyed, and re-sent
   `message.start` / delta frames reset or appended the sentence ledger. The client now honors
@@ -555,6 +569,15 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
   are short JSON request/response calls, so this does not affect it; the audio stream itself goes
   straight from the renderer to Google.
 
+## Deploying 0.9.1
+
+The picker fix is renderer-only: install the package, then **Rescan** in Capabilities → Plugins
+(or ⌘K → Reload desktop plugins). No gateway restart is needed for the fix. The new
+`debug_picker` setting is served by the backend, so it takes effect only after a gateway restart;
+to diagnose without one, create an empty `debug-picker.on` in the plugin's data folder
+(`%APPDATA%/Hermes/plugin-files/data/gemini-live-chat/` on Windows), Rescan, click once, and read
+`picker-debug.jsonl` next to it. Delete the `.on` file afterwards.
+
 ## Deploying 0.9.0
 
 Use the supplied local commit script (no push). It preserves the abandoned phone-wake backend
@@ -571,7 +594,7 @@ latency lines. The unit tests do not substitute for that acceptance.
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
 python -m pytest -q                   # 156 tests: minting, chain, fallback, routes, persona, wake word, restart
-node --test 'tests/js/*.test.mjs'     # 136 tests: delegation, hand-off, barge-in, transcript, transports, wake, guarded ack, recovery
+node --test 'tests/js/*.test.mjs'     # 141 tests: delegation, hand-off, barge-in, transcript, transports, wake, guarded ack, recovery, picker instances
 hermes plugins validate . --install-deps
 ```
 

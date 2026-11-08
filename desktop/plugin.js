@@ -21,7 +21,7 @@
 // Structure adapted from hermes-xai's voice module (MIT, Julien Talbot); Gemini Live wire facts from
 // hermes-gemini-live (MIT, Ha Trung). See README "Credits".
 import { host, icons, Popover, PopoverContent, PopoverTrigger } from '@hermes/plugin-sdk'
-import { createElement as h, useEffect, useState } from 'react'
+import { createElement as h, useEffect, useRef, useState } from 'react'
 
 export const PLUGIN_ID = 'gemini-live-chat'
 export const IN_RATE = 16000 // Gemini Live input: 16 kHz PCM16 mono
@@ -2212,11 +2212,87 @@ function chainText (status) {
 // stored by the backend in the plugin's data folder (POST /choice), so it is the same on every
 // window and device connected to this Hermes, and survives restarts.
 
-export const ui = { status: null, open: false, saving: false }
-export function openPicker (ctx, open = true) {
+// v0.9.1: ONE picker instance owns the open state. Desktop keeps a composer mounted for every
+// kept-alive chat tab / split pane (hidden ones sit under [data-pane-hidden][inert]), so the voice
+// button and its Popover exist N times. With a shared `open`, all N Popovers opened at once; each
+// PopoverContent moved focus into itself, the next one's focus was "outside" the previous one, and
+// Radix's DismissableLayer called onOpenChange(false): everything closed in the same tick. The
+// webapp on a phone mounts one composer, so it worked there. `ui.owner` names the instance whose
+// Popover is open; every other instance renders closed.
+export const ui = { status: null, open: false, saving: false, owner: null }
+let pickerSeq = 0
+export const pickers = new Map() // instance id -> the voice button's wrapper element (or null)
+export const newPickerId = () => `picker-${++pickerSeq}`
+
+const hiddenEl = el => !!(el && typeof el.closest === 'function' && el.closest('[data-pane-hidden],[inert]'))
+// The instance a picker opened without a clicked button (a notification action) belongs to: the
+// last-mounted one that is not in a hidden pane.
+export function visiblePicker () {
+  const all = [...pickers.keys()]
+  const shown = all.filter(id => { const el = pickers.get(id); return el && el.isConnected !== false && !hiddenEl(el) })
+  const list = shown.length ? shown : all
+  return list.length ? list[list.length - 1] : null
+}
+export function pickerIsOpen (id) {
+  return !!ui.open && (ui.owner ? ui.owner === id : id === visiblePicker())
+}
+
+export function openPicker (ctx, open = true, owner) {
   ui.open = !!open
+  ui.owner = ui.open ? (owner || visiblePicker()) : null
+  pickerDebug(ctx, 'openPicker', { want: !!open, by: owner ? 'instance' : 'any' })
   publish()
   if (ui.open) void refreshStatus(ctx)
+}
+
+// One instance's Radix onOpenChange. A close from an instance that does not own the picker is
+// ignored (it cannot have been showing it).
+export function pickerOpenChange (ctx, id, value) {
+  const accepted = !!value || !ui.owner || ui.owner === id
+  pickerDebug(ctx, 'onOpenChange', { value: !!value, self: id, accepted })
+  if (accepted) openPicker(ctx, !!value, value ? id : undefined)
+}
+
+// ── picker diagnostic (v0.9.1, off by default) ───────────────────────────────────────────────────
+// Setting `debug_picker: true` (needs the gateway to serve it in /status), or an empty file
+// `debug-picker.on` in the plugin's data folder (no restart). Writes picker-debug.jsonl to the data
+// folder: event names, booleans and counts only; no text, no DOM change.
+export const pickerDbg = { lines: [], file: false }
+export function pickerDebugOn () {
+  return !!((call.settings && call.settings.debug_picker) || pickerDbg.file)
+}
+export async function checkPickerDebugFile (ctx) {
+  try {
+    const r = ctx && ctx.files && typeof ctx.files.stat === 'function' ? await ctx.files.stat('data', 'debug-picker.on') : null
+    pickerDbg.file = !!(r && r.ok && r.exists)
+  } catch { pickerDbg.file = false }
+  return pickerDbg.file
+}
+function domFacts () {
+  const d = globalThis.document
+  if (!d || typeof d.querySelectorAll !== 'function') return {}
+  const a = d.activeElement
+  return {
+    contents: d.querySelectorAll('[data-slot="popover-content"]').length,
+    focusInContent: !!(a && typeof a.closest === 'function' && a.closest('[data-slot="popover-content"]')),
+    triggers: d.querySelectorAll('[data-slot="popover-trigger"]').length
+  }
+}
+export function pickerDebug (ctx, ev, extra) {
+  if (!pickerDebugOn() || !ctx || !ctx.files || typeof ctx.files.writeText !== 'function') return
+  const base = () => ({ t: Date.now(), ev, open: !!ui.open, owner: ui.owner, instances: pickers.size,
+    visibleOwner: visiblePicker(), desktop: !!E().isDesktopApp(), ...extra })
+  const write = () => {
+    pickerDbg.lines = pickerDbg.lines.slice(-199)
+    void Promise.resolve(ctx.files.writeText('data', 'picker-debug.jsonl', pickerDbg.lines.join('\n') + '\n')).catch(() => {})
+  }
+  try {
+    pickerDbg.lines.push(JSON.stringify({ ...base(), ...domFacts() }))
+    write()
+    E().setTimeout(() => {
+      try { pickerDbg.lines.push(JSON.stringify({ ...base(), ev: ev + '+100ms', ...domFacts() })); write() } catch { /* best effort */ }
+    }, 100)
+  } catch { /* never break the picker */ }
 }
 function pickerAction (ctx) { return { label: 'Voice providers', onClick: () => openPicker(ctx) } }
 export function pinLabel (status) {
@@ -2319,18 +2395,21 @@ function pickerSummary (status) {
   return PROVIDER_LABELS[choice] || choice
 }
 
-function ProviderPicker ({ ctx }) {
+// Radix drives the toggle: PopoverTrigger's click is composeEventHandlers(props.onClick,
+// onOpenToggle), so a second toggle of our own would cancel it. Our onClick only records the click
+// for the diagnostic.
+function ProviderPicker ({ ctx, id }) {
   useCall()
-  const setOpen = v => openPicker(ctx, v)
+  const open = pickerIsOpen(id)
   const label = `Voice provider: ${pickerSummary(ui.status)}`
-  return h(Popover, { open: ui.open, onOpenChange: setOpen },
+  return h(Popover, { open, onOpenChange: v => pickerOpenChange(ctx, id, v) },
     h(PopoverTrigger, {
         type: 'button',
-        onClick: () => setOpen(!ui.open),
+        onClick: () => pickerDebug(ctx, 'trigger.click', { self: id, wasOpen: open }),
         title: label,
         'aria-label': label,
         'aria-haspopup': 'menu',
-        'aria-expanded': ui.open,
+        'aria-expanded': open,
         // A finger-sized target on a phone; the chevron itself stays small.
         className: 'inline-flex h-7 min-w-5 shrink-0 items-center justify-center rounded-full px-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
       }, pinLabel(ui.status) ? h('span', { className: 'px-1 text-[0.6875rem] text-amber-500' }, pinLabel(ui.status)) : null,
@@ -2341,7 +2420,18 @@ function ProviderPicker ({ ctx }) {
 
 function VoiceButton ({ ctx }) {
   useCall()
-  useEffect(() => { void refreshStatus(ctx) }, [ctx])
+  const [id] = useState(newPickerId)
+  const ref = useRef(null)
+  useEffect(() => { void refreshStatus(ctx); void checkPickerDebugFile(ctx) }, [ctx])
+  useEffect(() => {
+    pickers.set(id, ref.current)
+    publish() // the visible instance may have changed
+    return () => {
+      pickers.delete(id)
+      if (ui.owner === id) { ui.open = false; ui.owner = null }
+      publish()
+    }
+  }, [id])
   const status = ui.status
   const live = call.state !== 'idle'
   const blocked = !live && status && !status.available
@@ -2352,8 +2442,12 @@ function VoiceButton ({ ctx }) {
     ? (call.switching ? 'Switching voice provider' : 'Connecting voice')
     : live ? (call.delegations ? `${servingLabel()}: ${who} is working (click to hang up)` : `${servingLabel()}: ${who} is listening (click to hang up)`)
       : blocked ? status.message : (call.detail || `Talk with ${who} (${via}). Right-click to choose the voice provider.`)
-  return h('span', { className: 'inline-flex shrink-0 items-center',
-    onContextMenu: ev => { ev?.preventDefault?.(); openPicker(ctx) } },
+  return h('span', { className: 'inline-flex shrink-0 items-center', ref,
+    onContextMenu: ev => {
+      ev?.preventDefault?.()
+      pickerDebug(ctx, 'contextmenu', { self: id })
+      openPicker(ctx, true, id)
+    } },
     h('button', {
       type: 'button',
       title: label,
@@ -2365,7 +2459,7 @@ function VoiceButton ({ ctx }) {
       className: 'inline-flex size-7 shrink-0 items-center justify-center rounded-full transition-colors ' +
         'hover:bg-muted disabled:opacity-50 ' + (live ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground')
     }, h(live ? icons.PhoneOff || icons.VolumeX : icons.AudioLines, { className: icons.iconSize.sm })),
-    h(ProviderPicker, { ctx }))
+    h(ProviderPicker, { ctx, id }))
 }
 
 // The status-bar chip always names the provider serving the call.

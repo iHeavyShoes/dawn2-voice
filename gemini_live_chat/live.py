@@ -152,6 +152,8 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "wake_phrase": _wake_phrase(raw.get("wake_phrase"), problems),
         "wake_sensitivity": _float_in(raw.get("wake_sensitivity"), DEFAULT_WAKE_SENSITIVITY, (0.0, 1.0)),
         "wake_surface": pick("wake_surface", lambda v: v in WAKE_SURFACES, DEFAULT_WAKE_SURFACE),
+        # v0.9.1: opt-in provider-picker diagnostic (renderer writes counts/booleans to its data folder).
+        "debug_picker": raw.get("debug_picker") is True or str(raw.get("debug_picker")).strip().lower() in ("true", "on", "yes", "1"),
         "problems": problems,
     }
 
@@ -443,7 +445,7 @@ def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
             "persona_gender", "identity_source", "transcription_languages", "providers",
             "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he",
-            "wake_word", "wake_surface")
+            "wake_word", "wake_surface", "debug_picker")
     out = {k: cfg[k] for k in keys if k in cfg}
     if cfg.get("wake_word"):
         out["wake_phrase"] = effective_wake_phrase(cfg)

@@ -146,8 +146,10 @@ def test_client_settings_carry_no_secret_and_no_instructions():
     assert set(out) == {"model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
                         "persona_gender", "identity_source", "transcription_languages", "providers",
                         "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he",
-                        "wake_word", "wake_surface"}
+                        "wake_word", "wake_surface", "debug_picker"}
     assert "be brief" not in json.dumps(out)
+    assert out["debug_picker"] is False
+    assert live.client_settings(live.settings({"debug_picker": "on"}))["debug_picker"] is True
     assert out["voice"] == "Charon"  # the effective voice, never "auto"
 
 
