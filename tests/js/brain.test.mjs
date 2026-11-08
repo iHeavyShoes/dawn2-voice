@@ -31,7 +31,7 @@ beforeEach(async () => {
   sdk.requestImpl = async () => ({ status: 'streaming' })
   sdk.host.state.activeSessionId.value = 'sess-1'
   sdk.host.state.focusedSessionId.value = 'sess-1'
-  P.call.settings = { transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he', persona_name: 'Ray', persona_gender: 'male', silence_ms: 1000 }
+  P.call.settings = { transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', persona_gender: 'male', silence_ms: 1000 }
   P.call.detail = ''
 })
 
@@ -334,7 +334,7 @@ test('greetings and bye are said by the plugin; bye hangs up after it is said', 
   assert.deepEqual(says(ws), [`${SAY}היי, אני כאן.`])
   geminiReads(ws)
   endAudio()
-  await geminiUser(ws, 'ביי')
+  await geminiUser(ws, 'ביי ריי') // v0.7: an explicit end-call phrase; a bare "ביי" does not hang up
   assert.equal(says(ws).at(-1), `${SAY}ביי.`)
   assert.equal(submits().length, 0)
   geminiReads(ws)

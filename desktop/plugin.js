@@ -270,7 +270,7 @@ const PHRASES = {
   bye: ['bye', 'bye bye', 'goodbye', 'good bye', 'good night', 'see you', 'see you later', 'talk later',
     'talk to you later', 'later', 'hang up', 'end call', 'end the call', 'thats all', 'thats it for now',
     'ביי', 'ביי ביי', 'להתראות', 'לילה טוב', 'נדבר', 'נדבר אחר כך', 'נדבר אחכ', 'תנתק', 'נתק',
-    'סיים שיחה', 'סיים את השיחה', 'זהו להיום', 'זהו זה', 'יאללה ביי']
+    'סיים שיחה', 'סיים את השיחה', 'תסיים שיחה', 'תסיים את השיחה', 'זהו להיום', 'זהו זה', 'יאללה ביי']
 }
 const FILLERS = new Set(['um', 'umm', 'uh', 'uhh', 'hmm', 'hm', 'er', 'erm', 'please', 'אממ', 'אמ', 'אהמ', 'אההה', 'אה', 'בבקשה', 'hermes', 'הרמס'])
 const REQUEST_WORDS = new Set(['check', 'continue', 'explain', 'summarize', 'summarise', 'search', 'find', 'open',
@@ -293,13 +293,45 @@ const PHRASE_INDEX = (() => {
 })()
 const KIND_ORDER = ['bye', 'stop', 'repeat', 'greeting', 'ack']
 
-function words (text, names) {
+function tokens (text) {
   const t = String(text || '').toLowerCase()
     .replace(/[\u0591-\u05C7]/g, '') // niqqud and cantillation
     .replace(/['’`׳"״]/g, '') // what's -> whats, צ'יפס -> ציפס
     .replace(/\b(uh|mm)[\s-]*(huh|hm+)\b/g, 'uhhuh') // a backchannel, not "uh" + "huh?"
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-  return t.split(/\s+/).filter(w => w && !FILLERS.has(w) && !names.has(w))
+  return t.split(/\s+/).filter(Boolean)
+}
+
+function words (text, names) {
+  return tokens(text).filter(w => !FILLERS.has(w) && !names.has(w))
+}
+
+// Persona names as the transcript may spell them: "ריי" also as "רי".
+const nameSet = names => {
+  const out = new Set()
+  for (const n of (names || []).filter(Boolean)) {
+    const k = String(n).toLowerCase().replace(/['’`׳"״]/g, '')
+    out.add(k)
+    if (k.includes('יי')) out.add(k.replace(/יי/g, 'י'))
+  }
+  return out
+}
+
+// v0.7: the spoken end-call command. A turn hangs up only when it is a "bye" turn AS A WHOLE (every
+// word is a goodbye, thanks or the persona's name: classifyTurn) AND it contains one of these
+// explicit phrases. So "ביי ריי", "סיים שיחה", "Bye Ray" and "end call" hang up, while a bare "ביי",
+// "ביי ביי" or "תודה ביי" does not, and neither does a sentence that only contains one ("תגיד לו ביי
+// ריי", "don't end the call": not a bye turn as a whole). <name> is each persona name, he and en.
+const END_PHRASES = ['end call', 'end the call', 'hang up', 'סיים שיחה', 'תסיים שיחה', 'סיים את השיחה',
+  'תסיים את השיחה', 'תנתק', 'נתק']
+const END_BY_NAME = ['bye', 'goodbye', 'good bye', 'bye bye', 'ביי', 'ביי ביי']
+export function isEndCall (text, opts = {}) {
+  const names = nameSet(opts.names)
+  if (classifyTurn(text, opts).kind !== 'bye') return false
+  const ws = tokens(text).filter(w => !FILLERS.has(w) || names.has(w)).map(w => (w.length > 2 && w.startsWith('ו') && !names.has(w) ? w.slice(1) : w))
+  const phrases = END_PHRASES.map(p => p.split(' '))
+  for (const n of names) for (const b of END_BY_NAME) phrases.push([...b.split(' '), n])
+  return phrases.some(p => ws.some((_, i) => p.every((w, k) => ws[i + k] === w)))
 }
 
 // Every word covered by phrases (longest match first; a Hebrew "ו" prefix is allowed)?
@@ -326,7 +358,7 @@ function cover (ws) {
 
 // -> { kind, lang, words }. kind: empty | greeting | ack | repeat | stop | bye | short | substantive.
 export function classifyTurn (text, opts = {}) {
-  const names = new Set((opts.names || []).filter(Boolean).map(n => String(n).toLowerCase().replace(/['’`׳"״]/g, '')))
+  const names = nameSet(opts.names)
   const raw = String(text || '')
   const ws = words(raw, names)
   const lang = langOf(raw)
@@ -439,7 +471,9 @@ const defaultEnv = () => ({
     try { return (globalThis.speechSynthesis ? globalThis.speechSynthesis.getVoices() : []).some(v => String(v.lang || '').toLowerCase().startsWith(prefix)) } catch { return false }
   },
   // v0.6: the per-turn latency line (numbers only) in the renderer console; the backend logs it too.
-  log: (...a) => { try { globalThis.console.info(...a) } catch { /* no console */ } }
+  log: (...a) => { try { globalThis.console.info(...a) } catch { /* no console */ } },
+  // v0.7: the Hermes Desktop app (Electron) as opposed to the webapp in a phone/desktop browser.
+  isDesktopApp: () => /\bElectron\//.test(String((globalThis.navigator && globalThis.navigator.userAgent) || ''))
 })
 let env = null
 const E = () => env || (env = defaultEnv())
@@ -450,6 +484,8 @@ const MIC_CONSTRAINTS = { audio: { channelCount: 1, autoGainControl: true, echoC
 // ── audio (Gemini transport: PCM over the socket) ────────────────────────────────────────────────
 
 async function startMic (onFrame, isLive) {
+  await micReleased()
+  if (!isLive()) return null
   const stream = await E().getUserMedia(MIC_CONSTRAINTS)
   if (!isLive()) { // the call was stopped while the permission prompt was open
     stream.getTracks().forEach(t => t.stop())
@@ -624,6 +660,7 @@ export const call = {
   lat: null, // latency of the turn in flight
   settings: null,
   ctx: null,
+  fromWake: false, // v0.7: this call was started by the wake word (it says "כן?" once it is up)
   listeners: new Set()
 }
 const publish = () => call.listeners.forEach(fn => { try { fn() } catch { /* isolated */ } })
@@ -799,11 +836,13 @@ export function tearDown (note) {
     interim: [], turns: [], lastAudioAt: 0, lastHeardAt: 0, speakingGroup: 0, provider: null, switching: false,
     partial: { user: '', assistant: '' }, delegations: 0, resumeHandle: null, tried: [], switches: 0, providersUsed: [],
     choice: 'auto', brain: null, owner: null, pendingHand: 0, userPending: false, eosAt: 0, held: null,
-    dropped: new Set(), stream: null, lastReply: '', awaitingAnswer: false, lang: null, lastTurn: null, lat: null
+    dropped: new Set(), stream: null, lastReply: '', awaitingAnswer: false, lang: null, lastTurn: null, lat: null,
+    fromWake: false
   })
   if (note !== undefined) call.detail = note
   publish()
   if (wasActive) void saveTranscript(ctx, sid, turns, (call.settings && call.settings.transcript_to_chat) || 'chat_turn', used)
+  resumeWake() // v0.7: every hang-up path (button, voice command, failure, dispose) re-arms the wake word
 }
 
 // The model counts as quiet when the user is not talking, no handed part is still waiting for its
@@ -936,6 +975,10 @@ function onBargeIn () {
 function onReady () {
   if (call.state !== 'connecting') return false
   call.state = 'live'
+  if (call.fromWake && !call.switching && isHermes()) {
+    call.fromWake = false
+    sayLocal('wake') // v0.7: "כן?" tells the user the call is up and listening
+  }
   if (call.switching) {
     call.switching = false
     call.detail = ''
@@ -970,6 +1013,7 @@ export function localLine (kind) {
     case 'ack': return he ? (female ? 'בודקת.' : 'בודק.') : 'Checking.'
     case 'greeting': return he ? 'היי, אני כאן.' : "Hi, I'm here."
     case 'bye': return he ? 'ביי.' : 'Bye.'
+    case 'wake': return he ? 'כן?' : 'Yes?'
     case 'switch': return he ? (female ? 'החלפתי ספק קול, ממשיכה.' : 'החלפתי ספק קול, ממשיך.') : 'I switched voice provider; carrying on.'
     case 'rest': return he ? 'ההמשך בצ\'אט.' : 'The rest is in the chat.'
     default: return ''
@@ -1126,6 +1170,9 @@ function finishStream (s) {
 export function onUserTurn (text, eos) {
   const t = norm(text)
   const c = classifyTurn(t, { names: personaNames(), awaiting: call.awaitingAnswer })
+  // v0.7: a goodbye without an explicit end-call phrase ("ביי", "תודה ביי") does not hang up; it
+  // counts as a backchannel (an interrupted reply resumes).
+  if (c.kind === 'bye' && !isEndCall(t, { names: personaNames() })) c.kind = 'ack'
   if (c.lang) call.lang = c.lang
   call.lastTurn = c
   resolveHold(c.kind)
@@ -1133,9 +1180,17 @@ export function onUserTurn (text, eos) {
   call.awaitingAnswer = false
   if (c.kind === 'greeting') sayLocal('greeting')
   else if (c.kind === 'stop') stopSpeaking()
-  else if (c.kind === 'bye') { stopSpeaking(); sayLocal('bye', { bye: true }) } else if (c.kind === 'repeat' && call.lastReply) { stopSpeaking(); sayReply(call.lastReply) } else delegateTurn(t, eos)
+  else if (c.kind === 'bye') endByVoice()
+  else if (c.kind === 'repeat' && call.lastReply) { stopSpeaking(); sayReply(call.lastReply) } else delegateTurn(t, eos)
   publish()
   return c
+}
+
+// The spoken end-call command: the voice says a short goodbye, then the call hangs up through the
+// same tearDown as the button (transcript saved, mic released, wake word re-armed).
+function endByVoice () {
+  stopSpeaking()
+  sayLocal('bye', { bye: true })
 }
 
 function delegateTurn (text, eos) {
@@ -1499,6 +1554,8 @@ async function openRealtime (minted, gen) {
   }
   let stream
   try {
+    await micReleased()
+    if (!current()) return
     stream = await E().getUserMedia(MIC_CONSTRAINTS)
   } catch (error) {
     if (current()) tearDown('Microphone unavailable: ' + (error && error.message ? error.message : String(error)))
@@ -1808,6 +1865,7 @@ export async function start (ctx) {
   }
   call.gen += 1
   const gen = call.gen
+  if (!wake.ctx) wake.ctx = ctx
   Object.assign(call, {
     state: 'connecting', detail: '', turns: [], queue: [], handing: false, sessionId: sid, ctx,
     provider: null, tried: [], switches: 0, switching: false, providersUsed: []
@@ -2087,6 +2145,68 @@ export function onMessageComplete (event) {
   publish()
 }
 
+// ── v0.7: wake word ("hey ray" starts this call) ───────────────────────────────────────────────
+// The detector runs in the gateway (gemini_live_chat/wake.py, core's sherpa engine) while core's own
+// wake word is off. A detection arrives as plugin.gemini-live-chat.wake.detected {token}; the first
+// eligible window to claim the token starts the call on its open chat. The detector has already
+// released the microphone when the event is sent; a call started from the button pauses it first
+// (micReleased). Every hang-up re-arms it (resumeWake in tearDown).
+export const wake = { armed: false, owned: false, status: null, ctx: null, starting: false }
+
+async function wakeRest (path, body = {}) {
+  const ctx = wake.ctx
+  if (!ctx || !ctx.rest) return null
+  try { return await ctx.rest(path, { method: 'POST', body }) } catch { return null }
+}
+
+export async function armWake (ctx) {
+  wake.ctx = ctx
+  let s
+  try { s = await ctx.rest('/wake/arm', { method: 'POST', body: {} }) } catch { s = null }
+  wake.status = s
+  wake.armed = !!(s && s.enabled && ['arming', 'listening', 'paused'].includes(s.state))
+  if (s && s.enabled && s.state === 'error' && s.error) host.notify({ kind: 'warning', message: 'Wake word: ' + s.error })
+  return s
+}
+
+// Only this window answers when the setting says so: "desktop" (default) = the Hermes Desktop app;
+// the PC's microphone heard the phrase, so a phone tab must not start talking.
+export function wakeEligible () {
+  const surface = (wake.status && wake.status.surface) || 'desktop'
+  return surface === 'any' || !!E().isDesktopApp()
+}
+
+export async function onWakeDetected (ev) {
+  const payload = (ev && ev.payload) || ev || {}
+  if (!wake.ctx || !payload.token || call.state !== 'idle' || wake.starting || !wakeEligible()) return false
+  wake.starting = true
+  try {
+    const r = await wakeRest('/wake/claim', { token: payload.token })
+    if (!r || !r.claimed || call.state !== 'idle') return false // another window took it
+    wake.owned = true // the detector paused itself (mic released) before sending the event
+    call.fromWake = true
+    await start(wake.ctx) // the open chat, as with the button; "כן?" once the call is up
+    if (call.state === 'idle') { call.fromWake = false; resumeWake() } // no chat open: listen again
+    return true
+  } finally {
+    wake.starting = false
+  }
+}
+
+// Wait until the wake detector no longer holds the microphone (the wakePauseBarrier pattern of
+// core's composer). The gateway answers after pause_listening() returned, i.e. the stream is closed.
+async function micReleased () {
+  if (!wake.armed || wake.owned) return
+  const r = await wakeRest('/wake/pause')
+  wake.owned = !!(r && r.paused)
+}
+
+function resumeWake () {
+  if (!wake.armed || !wake.owned) return // only a detector this window paused is re-armed
+  wake.owned = false
+  void wakeRest('/wake/resume')
+}
+
 export default {
   id: PLUGIN_ID,
   name: 'Live voice (Gemini / ChatGPT)',
@@ -2096,6 +2216,8 @@ export default {
     ctx.onEvent('message.interim', onMessageInterim)
     ctx.onEvent('message.start', onMessageStart) // v0.6 brain: hermes streaming
     ctx.onEvent('message.delta', onMessageDelta)
+    ctx.onEvent('plugin.gemini-live-chat.wake.detected', ev => { void onWakeDetected(ev) }) // v0.7
+    void armWake(ctx)
     // Disable / unload / hot-reload: hang up and release everything (mic, sockets, peer, audio).
     ctx.onDispose(() => tearDown())
     ctx.register({ id: 'talk', area: 'composer.actions', order: 42, render: () => h(VoiceButton, { ctx }) })
