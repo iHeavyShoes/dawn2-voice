@@ -146,8 +146,42 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "providers": _providers(raw.get("providers"), problems),
         "openai_model": str(pick("openai_model", _valid_openai_model, _OPENAI_DEFAULT_MODEL)).strip(),
         "openai_voice": pick("openai_voice", lambda v: v == AUTO or v in _OPENAI_VOICES, AUTO),
+        # v0.7: the plugin's own wake word (off by default; see gemini_live_chat/wake.py).
+        "wake_word": raw.get("wake_word") is True or str(raw.get("wake_word")).strip().lower() in ("true", "on", "yes", "1"),
+        "wake_phrase": _wake_phrase(raw.get("wake_phrase"), problems),
+        "wake_sensitivity": _float_in(raw.get("wake_sensitivity"), DEFAULT_WAKE_SENSITIVITY, (0.0, 1.0)),
+        "wake_surface": pick("wake_surface", lambda v: v in WAKE_SURFACES, DEFAULT_WAKE_SURFACE),
         "problems": problems,
     }
+
+
+DEFAULT_WAKE_SENSITIVITY = 0.5
+#: desktop: only the Hermes Desktop app answers the wake word (the detector hears the PC's
+#: microphone, so a phone tab answering it would talk through the phone about a PC-side wake).
+#: any: the first open window claims it.
+WAKE_SURFACES = ("desktop", "any")
+DEFAULT_WAKE_SURFACE = "desktop"
+
+
+def _float_in(raw: Any, default: float, bounds: Tuple[float, float]) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if bounds[0] <= value <= bounds[1] else default
+
+
+def _wake_phrase(raw: Any, problems: list) -> str:
+    """"" = ``hey <persona name>`` (resolved later); else an English phrase the engine can spot."""
+    if raw in (None, ""):
+        return ""
+    from . import wake
+    phrase = wake.clean_phrase(raw)
+    if phrase is None:
+        problems.append(f"settings.wake_phrase {raw!r} is not valid (English letters only, e.g. \"hey ray\"); "
+                        "using \"hey <persona name>\"")
+        return ""
+    return phrase
 
 
 # Late-bound to keep live.py importable on its own (openai_rt and providers import live).
@@ -407,5 +441,19 @@ def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg = resolve_persona(cfg)
     keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
             "persona_gender", "identity_source", "transcription_languages", "providers",
-            "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he")
-    return {k: cfg[k] for k in keys if k in cfg}
+            "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he",
+            "wake_word", "wake_surface")
+    out = {k: cfg[k] for k in keys if k in cfg}
+    if cfg.get("wake_word"):
+        out["wake_phrase"] = effective_wake_phrase(cfg)
+    return out
+
+
+def effective_wake_phrase(cfg: Dict[str, Any]) -> str:
+    """The phrase the detector listens for: the setting, else ``hey <persona name>``."""
+    from . import wake
+    if cfg.get("wake_phrase"):
+        return cfg["wake_phrase"]
+    if "identity_source" not in cfg:
+        cfg = resolve_persona(cfg)
+    return wake.default_phrase(cfg.get("persona_name"))

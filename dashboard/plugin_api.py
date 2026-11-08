@@ -17,6 +17,10 @@
 
 * ``POST /latency`` -> one log line per voice turn (milliseconds from end-of-speech to submit,
   first Hermes text, first audio; ids, enums and integers only).
+* v0.7 wake word (``settings.wake_word``): ``GET /wake`` (state), ``POST /wake/arm`` (listen when the
+  setting is on, stop when off), ``/wake/claim {token}`` (the first window to claim a detection
+  starts the call), ``/wake/pause`` and ``/wake/resume`` (the call's microphone hand-off). A
+  detection is pushed as the plugin event ``plugin.gemini-live-chat.wake.detected {token, phrase}``.
 
 Credentials never leave this side and are never returned or logged:
 
@@ -45,7 +49,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import latency, live, openai_rt, prefs, providers  # noqa: E402
+from gemini_live_chat import latency, live, openai_rt, prefs, providers, wake  # noqa: E402
 
 logger = logging.getLogger("gemini-live-chat")
 router = APIRouter()
@@ -231,6 +235,55 @@ def latency_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return {"ok": False}
     logger.info("gemini-live-chat: %s", latency.line(rec))
     return {"ok": True}
+
+
+# ── v0.7: the plugin's own wake word (gemini_live_chat/wake.py) ─────────────────────────────────
+
+
+def _wake_status(m: "wake.WakeManager", cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = m.status()
+    out["enabled"] = bool(cfg.get("wake_word"))
+    out["surface"] = cfg.get("wake_surface", live.DEFAULT_WAKE_SURFACE)
+    if out["enabled"]:
+        out["phrase"] = out["phrase"] or live.effective_wake_phrase(cfg)
+    return out
+
+
+@router.get("/wake")
+def wake_status() -> Dict[str, Any]:
+    return _wake_status(wake.manager(), _settings())
+
+
+@router.post("/wake/arm")
+def wake_arm() -> Dict[str, Any]:
+    """Start listening when the ``wake_word`` setting is on (idempotent); disarm when it is off, so a
+    settings change applies on the next window load. The renderer calls this once per window."""
+    cfg = _settings()
+    m = wake.manager()
+    if not cfg.get("wake_word"):
+        m.disarm()
+    else:
+        m.arm(live.effective_wake_phrase(cfg), cfg.get("wake_sensitivity", live.DEFAULT_WAKE_SENSITIVITY))
+    return _wake_status(m, cfg)
+
+
+@router.post("/wake/claim")
+def wake_claim(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The first window to claim a detection starts the call; every later claim gets false."""
+    body = body if isinstance(body, dict) else {}
+    return {"claimed": wake.manager().claim(body.get("token"))}
+
+
+@router.post("/wake/pause")
+def wake_pause() -> Dict[str, Any]:
+    """Free the microphone before a call opens its own (a call started from the button)."""
+    return {"paused": wake.manager().pause()}
+
+
+@router.post("/wake/resume")
+def wake_resume() -> Dict[str, Any]:
+    """Listen again after a hang-up (retries while the browser still holds the device)."""
+    return {"resuming": wake.manager().resume()}
 
 
 @router.post("/session")
