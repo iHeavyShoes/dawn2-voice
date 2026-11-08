@@ -318,14 +318,19 @@ test('streaming: code and links are not read out, the note is in the reply\'s la
 
 // ── the ack, local lines ───────────────────────────────────────────────────────────────────────
 
-test('a short "checking" is spoken only when Hermes has not started talking', async () => {
+test('a short ack (from the phrase bank) is spoken only when Hermes has not started talking', async () => {
+  P.resetAckMemory()
+  P.setEnv({ ...P.__env(), random: () => 0.99 }) // no silence, no echo: a plain bank phrase
   const ws = await geminiCall()
-  await geminiUser(ws, 'כדאי לי להשתמש בריסט?')
+  await geminiUser(ws, 'תבדוק לי בבקשה אם כדאי להשתמש בריסט עכשיו?')
   fire(P.ACK_DELAY_MS)
-  assert.deepEqual(says(ws), [`${SAY}בודק.`])
+  const first = says(ws)
+  assert.equal(first.length, 1)
+  const ack = first[0].slice(SAY.length)
+  assert.ok(P.verifyAck(ack, 'תבדוק לי בבקשה אם כדאי להשתמש בריסט עכשיו?'), ack)
   geminiReads(ws)
   P.onMessageComplete(ev('message.complete', { text: 'כן, כדאי עכשיו.' }))
-  assert.deepEqual(says(ws), [`${SAY}בודק.`, `${SAY}כן, כדאי עכשיו.`])
+  assert.deepEqual(says(ws), [first[0], `${SAY}כן, כדאי עכשיו.`])
 })
 
 test('greetings and bye are said by the plugin; bye hangs up after it is said', async () => {

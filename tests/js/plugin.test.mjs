@@ -354,7 +354,7 @@ test('hang-up saves the transcript once to the open chat (queued turn) and to th
   assert.equal(saves[0].params.queued, true)
   assert.ok(!saves[0].params.surface, 'not a voice delegation')
   assert.ok(saves[0].params.text.startsWith(P.TRANSCRIPT_HEADER + '\n\n'), 'the hang-up note heads the turn')
-  assert.equal(P.TRANSCRIPT_HEADER, '[Voice call transcript (live voice). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]')
+  assert.equal(P.TRANSCRIPT_HEADER, '[Voice call transcript. Check it for any request that was not delegated or answered in this chat, and for any voice bug; report only problems. Otherwise do not comment on the call: the user often hangs up only to save live quota, so continue the conversation in text from where the call left off (last open point or next step), in one or two lines.]')
   assert.match(saves[0].params.text, /User: שלום, מה שלומך\?\nVoice: Hi there!/)
   assert.equal(ctx.written.length, 1)
   assert.equal(ctx.written[0].folder, 'data')

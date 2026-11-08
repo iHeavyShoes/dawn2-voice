@@ -46,7 +46,7 @@ export const RECEIPT = 'WORK_STARTED: the whole request is in the open chat and 
 // the autonomous-lane rule): a reply that is one of these, or has one as its own first or last line,
 // or opens with a bracketed one, is not for the user and is never handed to the voice.
 export const SILENT_MARKERS = ['[SILENT]', 'SILENT', 'NO_REPLY', 'NO REPLY', '[静默]', '静默', '[沉默]', '沉默']
-export const TRANSCRIPT_HEADER = '[Voice call transcript (live voice). Check it for any request the user made during the call that was not delegated or not answered in this chat; if you find one, tell the user or handle it. If nothing was missed, reply with one short line.]'
+export const TRANSCRIPT_HEADER = '[Voice call transcript. Check it for any request that was not delegated or answered in this chat, and for any voice bug; report only problems. Otherwise do not comment on the call: the user often hangs up only to save live quota, so continue the conversation in text from where the call left off (last open point or next step), in one or two lines.]'
 
 // ── brain: hermes (v0.6) ─────────────────────────────────────────────────────────────────────────
 // `brain: hermes` (the default): the renderer, not the voice model, decides. Every final user turn
@@ -237,8 +237,40 @@ export function langOf (text) {
 }
 
 // Hermes' markdown as words to read verbatim, with the code/link notes in the reply's language.
-export function sayText (text) {
-  return speakable(text, langOf(text) === 'he' ? MARKERS_HE : MARKERS_EN)
+// v0.8: a leading speaker label ("ריי: ", "**Ray:**") is never read aloud.
+export function sayText (text, names) {
+  const t = stripSpeakerLabels(text, names)
+  return speakable(t, langOf(t) === 'he' ? MARKERS_HE : MARKERS_EN)
+}
+
+const escapeRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const DEFAULT_LABEL_NAMES = ['hermes', 'הרמס', 'assistant']
+function labelNames (names) {
+  const out = new Set()
+  for (const n of [...(names || []), ...DEFAULT_LABEL_NAMES].filter(Boolean)) {
+    const k = String(n).trim()
+    if (!k) continue
+    out.add(k)
+    if (k.includes('יי')) out.add(k.replace(/יי/g, 'י')) // the transcript spells ריי also רי
+  }
+  return [...out].sort((a, b) => b.length - a.length)
+}
+function labelRe (names) {
+  const alt = labelNames(names).map(escapeRe).join('|')
+  // At a line start: optional markdown emphasis, the name, optional emphasis, a colon (":" or "：").
+  return new RegExp(`^([ \\t>]*)(?:[*_]{1,2})?(?:${alt})(?:[*_]{1,2})?\\s*[:：](?:[*_]{1,2})?[ \\t]*`, 'gimu')
+}
+
+// v0.8: "ריי: כן, זה אפשרי" -> "כן, זה אפשרי". Only a label at the start of a line, and only the
+// persona's names (he/en) or Hermes: a colon later in a sentence ("השעה: 10") stays.
+export function stripSpeakerLabels (text, names) {
+  return String(text || '').replace(labelRe(names), '$1')
+}
+
+// A piece that is nothing but the persona's name ("ריי", "Ray.") is a dangling label, not words.
+export function isLabelOnly (piece, names) {
+  const t = String(piece || '').replace(/[\s*_.,:：!?…-]+/g, ' ').trim().toLowerCase()
+  return !!t && labelNames(names).some(n => n.toLowerCase() === t)
 }
 
 // The turn classifier: small, local, rule based, Hebrew and English. A turn is trivially
@@ -451,6 +483,7 @@ const defaultEnv = () => ({
   setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
   clearTimeout: id => globalThis.clearTimeout(id),
   now: () => Date.now(),
+  random: () => Math.random(), // v0.8: the ack picker (tests make it deterministic)
   // v0.5: the spoken notice when the chosen provider fails (its own voice is gone by then): the
   // browser's local speech synthesis, nothing leaves the machine. False when unavailable.
   speak: (text, lang) => {
@@ -478,6 +511,7 @@ const defaultEnv = () => ({
 let env = null
 const E = () => env || (env = defaultEnv())
 export function setEnv (overrides) { env = { ...defaultEnv(), ...overrides } }
+export const __env = () => E() // tests: extend the current env
 
 const MIC_CONSTRAINTS = { audio: { channelCount: 1, autoGainControl: true, echoCancellation: true, noiseSuppression: true } }
 
@@ -871,7 +905,7 @@ function armFlushRetry () {
 // Queue one Hermes reply for the voice. Returns the number of messages queued (0: silent or empty).
 export function enqueueResult (text) {
   if (isHermes()) return sayReply(text)
-  const messages = resultMessages(text)
+  const messages = resultMessages(stripSpeakerLabels(text, personaNames()))
   if (!messages.length) return 0
   call.group += 1
   for (const m of messages) call.queue.push({ text: m, group: call.group })
@@ -1010,7 +1044,6 @@ export function localLine (kind) {
   const he = callLang() === 'he'
   const female = !!(call.settings && call.settings.persona_gender === 'female')
   switch (kind) {
-    case 'ack': return he ? (female ? 'בודקת.' : 'בודק.') : 'Checking.'
     case 'greeting': return he ? 'היי, אני כאן.' : "Hi, I'm here."
     case 'bye': return he ? 'ביי.' : 'Bye.'
     case 'wake': return he ? 'כן?' : 'Yes?'
@@ -1023,6 +1056,125 @@ export function localLine (kind) {
 function personaNames () {
   const s = call.settings || {}
   return [s.persona_name, s.persona_name_he, 'hermes', 'הרמס']
+}
+
+// ── v0.8: the acknowledgement (a person saying "hmm, one sec", not a bot narrating) ──────────────
+// Picked locally from a phrase bank; the voice model never writes it, so it cannot answer, guess or
+// promise. Sometimes it echoes 1-3 words of the user's own turn; sometimes it says nothing at all.
+// Rules: <= ACK_MAX_WORDS words; never one of the last ACK_RECENT acks; an echo about one turn in
+// three and never twice in a row; a q-only phrase ("good question") only after a question; the bare
+// "בודק" is rare; every word is either the bank's or the user's own (verifyAck), so no new fact,
+// number, time or name can appear. {m|f} is the persona's grammatical gender.
+export const ACK_MAX_WORDS = 8
+export const ACK_RECENT = 5
+export const ACK_ECHO_ODDS = 1 / 3
+export const ACK_SILENT_ODDS = 0.35 // only when the reply is likely fast (a short question)
+export const ACK_BANK = {
+  he: [
+    'רגע.', 'שנייה, בוא נראה.', 'אוקיי, {מסתכל|מסתכלת}.', 'הממ, רגע.', 'כן, שנייה.', 'אה, בוא נראה.',
+    { t: 'שאלה טובה, שנייה.', q: true }, 'רגע אחד.', 'אוקיי, שנייה.', 'טוב, בוא נראה.', 'רגע, רגע.',
+    'אוקיי, רגע אחד.', 'הממ, בוא נראה.', 'כן כן, שנייה.', 'שנייה אחת.', 'אחלה, רגע.', 'סבבה, שנייה.',
+    'רגע, {מסתכל|מסתכלת}.', 'יאללה, שנייה.', 'טוב, רגע.', 'אה, שנייה.', 'בסדר, בוא נראה.', 'כן, רגע.',
+    'הממ, שנייה אחת.', 'רגע, אני {מסתכל|מסתכלת}.', 'יאללה, רגע אחד.', 'אוקיי, בוא נראה.',
+    { t: 'יאללה, {בודק|בודקת} לך.', w: 0.3 }, { t: 'שאלה טובה, רגע.', q: true }
+  ],
+  en: [
+    'One sec.', 'Hmm, let me see.', 'Okay, looking.', 'Sure, one moment.', "Let's see.",
+    { t: 'Good question, one sec.', q: true }, 'Hold on.', 'Okay, one sec.', 'Right, let me look.',
+    'Mm, one moment.', "Alright, let's see.", 'Yeah, one sec.', 'Just a sec.', 'Hmm, hold on.',
+    'Sure, let me look.', 'Let me see.', 'One moment.', "Okay, let's see.", 'Alright, one sec.',
+    'Got it, one sec.', 'Mm-hm, let me look.', 'Right, one moment.', 'Sure thing, hold on.',
+    'Okay, just a moment.', "Ah, let's see.", 'Hmm, one sec.', { t: 'Ooh, good question.', q: true },
+    { t: 'Checking.', w: 0.3 }
+  ]
+}
+// {topic} is 1-3 words copied from the user's turn; every template tolerates any phrase there.
+export const ACK_ECHO = {
+  he: ['אה, {topic}, שנייה.', '{topic}? רגע.', '{topic}, בוא נראה.', 'אוקיי, {topic}, רגע.', 'הממ, {topic}, שנייה.'],
+  en: ['Ah, {topic}, one sec.', '{topic}? Let me see.', 'Okay, {topic}, let me look.', 'Hmm, {topic}, hold on.']
+}
+// Words that are never a topic: question/request words, pronouns, function words, fillers.
+const TOPIC_STOP = new Set(('מה איך למה מתי איפה מי כמה האם אם יש אין לי לך לו לה לנו לכם להם את אותו אותה ' +
+  'של על עם אל זה זאת זו הזה הזאת הזו גם רק כבר עוד אני אתה את אנחנו הוא היא הם תבדוק תבדקי בדוק תגיד תגידי ' +
+  'תסביר תסבירי תספר תספרי תראה תראי תמצא תמצאי תחפש תחפשי תסתכל תסתכלי תוכל תוכלי אפשר בבקשה רגע טוב אוקיי ' +
+  'כן לא נו אז ו או קורה מצב ' +
+  'what whats how why when where who which is are was were do does did can could would should will the a an ' +
+  'my me your i you we it its this that of on in at for to about with please check tell show find look ' +
+  'search give any there have has get okay ok so and or just').split(' '))
+
+const ackMemory = { recent: [], lastEcho: false }
+export function resetAckMemory () { ackMemory.recent = []; ackMemory.lastEcho = false }
+
+const gendered = (t, female) => t.replace(/\{([^|{}]+)\|([^|{}]+)\}/g, (_, m, f) => (female ? f : m))
+const ackWords = t => String(t || '').toLowerCase().replace(/[^\p{L}\p{N}'\s-]/gu, ' ').split(/\s+/).filter(Boolean)
+
+// The topic: the first 1-3 consecutive content words of the turn, exactly as the user said them.
+export function ackTopic (turn, names) {
+  const skip = nameSet(names)
+  const raw = String(turn || '').split(/[\s]+/).map(w => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')).filter(Boolean)
+  const out = []
+  for (const w of raw) {
+    const k = w.toLowerCase().replace(/['’`׳"״]/g, '')
+    const content = !TOPIC_STOP.has(k) && !skip.has(k) && !FILLERS.has(k) && !/^\p{N}+$/u.test(k) && k.length > 1
+    if (content) { out.push(w); if (out.length === 3) break } else if (out.length) break
+  }
+  return out.length ? out.slice(0, 2).join(' ') : ''
+}
+
+// The guard: true only when the ack is short and adds nothing. Every word must come from the phrase
+// bank (any gender form) or from the user's own turn, so no fact, number, time or name is new.
+let ACK_VOCAB = null
+function ackVocab () {
+  if (ACK_VOCAB) return ACK_VOCAB
+  ACK_VOCAB = new Set()
+  for (const lang of Object.keys(ACK_BANK)) {
+    for (const e of [...ACK_BANK[lang], ...ACK_ECHO[lang]]) {
+      const t = typeof e === 'string' ? e : e.t
+      for (const g of [false, true]) ackWords(gendered(t, g).replace('{topic}', '')).forEach(w => ACK_VOCAB.add(w))
+    }
+  }
+  return ACK_VOCAB
+}
+export function verifyAck (ack, turn) {
+  const ws = ackWords(ack)
+  if (!ws.length || ws.length > ACK_MAX_WORDS) return false
+  const own = new Set(ackWords(turn))
+  return ws.every(w => ackVocab().has(w) || own.has(w))
+}
+
+// One ack for the user's turn, or '' (silence). Pure apart from the shared memory of recent acks;
+// `rand` is injectable (tests).
+export function pickAck (turn, opts = {}) {
+  const lang = opts.lang === 'en' ? 'en' : 'he'
+  const female = !!opts.female
+  const rand = opts.rand || Math.random
+  const ws = words(turn, nameSet(opts.names))
+  const question = /[?？]/.test(String(turn || '')) || (ws.length > 0 && QUESTION_WORDS.has(ws[0]))
+  const request = ws.some(w => REQUEST_WORDS.has(w) || /^ת[\u05D0-\u05EA]{3,}$/.test(w))
+  // Likely fast: a short question that asks for no work. Silence is a valid answer then.
+  if (ws.length <= 4 && !request && rand() < ACK_SILENT_ODDS) return ''
+  let ack = ''
+  const topic = ackTopic(turn, opts.names)
+  if (topic && !ackMemory.lastEcho && rand() < ACK_ECHO_ODDS) {
+    const choices = ACK_ECHO[lang].map(t => gendered(t, female).replace('{topic}', topic))
+      .filter(t => !ackMemory.recent.includes(t) && verifyAck(t, turn))
+    if (choices.length) ack = choices[Math.floor(rand() * choices.length)]
+  }
+  const echo = !!ack
+  if (!ack) {
+    const pool = ACK_BANK[lang].map(e => (typeof e === 'string' ? { t: e } : e))
+      .filter(e => !e.q || question)
+      .map(e => ({ t: gendered(e.t, female), w: e.w || 1 }))
+      .filter(e => !ackMemory.recent.includes(e.t) && verifyAck(e.t, turn))
+    const total = pool.reduce((n, e) => n + e.w, 0)
+    let r = rand() * total
+    for (const e of pool) { r -= e.w; if (r < 0) { ack = e.t; break } }
+    if (!ack && pool.length) ack = pool[pool.length - 1].t
+  }
+  if (!ack || !verifyAck(ack, turn)) return ''
+  ackMemory.lastEcho = echo
+  ackMemory.recent = [...ackMemory.recent, ack].slice(-ACK_RECENT)
+  return ack
 }
 
 // Queue words for the voice to read verbatim. kind: ack | local | reply.
@@ -1053,8 +1205,8 @@ export function sayReply (text) {
   const g = call.group
   let total = 0
   let n = 0
-  for (const p of cutPieces(sayText(text), true).pieces) {
-    if (isMarker(p)) continue
+  for (const p of cutPieces(sayText(text, personaNames()), true).pieces) {
+    if (isMarker(p) || isLabelOnly(p, personaNames())) continue
     if (total > MAX_REPLY_CHARS) { enqueueSay(localLine('rest'), g); break }
     total += p.length
     n += 1
@@ -1077,7 +1229,7 @@ const couldBeMarker = raw => {
 
 function emitPiece (s, p) {
   s.spoken = s.spoken ? `${s.spoken} ${p}` : p
-  if (isMarker(p) || s.capped) return
+  if (isMarker(p) || s.capped || isLabelOnly(p, personaNames())) return
   if (s.said.has(norm(p))) return // already read in an earlier segment of this reply
   if (s.chars > MAX_REPLY_CHARS) { s.capped = true; enqueueSay(localLine('rest'), s.group); return }
   s.chars += p.length
@@ -1093,7 +1245,7 @@ function pump (s, final) {
   if (isSilent(s.raw)) { s.silent = !s.chars; return }
   if (!final && !s.spoken && couldBeMarker(s.raw)) return // "NO" may still become "NO_REPLY"
   // sayText trims; a trailing space in the raw stream is what confirms the last sentence ended.
-  const text = sayText(s.raw) + (/\s$/.test(s.raw) ? ' ' : '')
+  const text = sayText(s.raw, personaNames()) + (/\s$/.test(s.raw) ? ' ' : '')
   const { pieces } = cutPieces(text, final)
   for (const p of freshPieces(pieces, s.spoken)) emitPiece(s, p)
 }
@@ -1140,7 +1292,7 @@ function relayComplete (payload) {
   const final = textOf(payload.text).trim()
   if (final && !isSilent(final)) {
     pump(s, false) // complete sentences only: the unfinished tail is covered by the final text
-    for (const p of cutPieces(sayText(final), true).pieces) {
+    for (const p of cutPieces(sayText(final, personaNames()), true).pieces) {
       if (!s.said.has(norm(p))) emitPiece(s, p)
     }
   } else if (!final) {
@@ -1195,17 +1347,24 @@ function endByVoice () {
 
 function delegateTurn (text, eos) {
   latStart(eos)
-  armAck()
+  armAck(text)
   void delegate(text)
 }
 
-function armAck () {
+// The 900 ms rule: when Hermes' first sentence is in by then, no ack at all.
+function armAck (turn) {
   if (call.ackTimer) E().clearTimeout(call.ackTimer)
   const lat = call.lat
   call.ackTimer = E().setTimeout(() => {
     call.ackTimer = null
     if (call.state === 'idle' || (lat && lat.firstText) || call.lat !== lat) return
-    sayLocal('ack')
+    const ack = pickAck(turn, {
+      lang: callLang(), female: !!(call.settings && call.settings.persona_gender === 'female'),
+      names: personaNames(), rand: E().random
+    })
+    if (!ack) return // silence is a valid ack
+    call.group += 1
+    enqueueSay(ack, call.group, { kind: 'ack' })
   }, ACK_DELAY_MS)
 }
 
@@ -2151,7 +2310,9 @@ export function onMessageComplete (event) {
 // eligible window to claim the token starts the call on its open chat. The detector has already
 // released the microphone when the event is sent; a call started from the button pauses it first
 // (micReleased). Every hang-up re-arms it (resumeWake in tearDown).
-export const wake = { armed: false, owned: false, status: null, ctx: null, starting: false }
+export const wake = { armed: false, owned: false, status: null, ctx: null, starting: false, pollTimer: null, lastError: '' }
+export const WAKE_POLL_MS = 45000 // v0.8: idle check that the detector is still up (gateway restart)
+const WAKE_UP = ['arming', 'listening', 'paused']
 
 async function wakeRest (path, body = {}) {
   const ctx = wake.ctx
@@ -2163,10 +2324,60 @@ export async function armWake (ctx) {
   wake.ctx = ctx
   let s
   try { s = await ctx.rest('/wake/arm', { method: 'POST', body: {} }) } catch { s = null }
+  if (!s) return s // gateway unreachable (restarting): keep the last known state; the next check retries
   wake.status = s
-  wake.armed = !!(s && s.enabled && ['arming', 'listening', 'paused'].includes(s.state))
-  if (s && s.enabled && s.state === 'error' && s.error) host.notify({ kind: 'warning', message: 'Wake word: ' + s.error })
+  wake.armed = !!(s.enabled && WAKE_UP.includes(s.state))
+  const err = s.enabled && s.state === 'error' && s.error ? s.error : ''
+  if (err && err !== wake.lastError) host.notify({ kind: 'warning', message: 'Wake word: ' + err }) // once per error
+  wake.lastError = err
   return s
+}
+
+// v0.8: the detector lives in the gateway; a gateway restart kills it while this window stays loaded.
+// Re-arm (POST /wake/arm, idempotent) when the gateway socket comes back, and when the idle check
+// finds it down. Never during a call or while a wake is being claimed: the call holds the mic, and
+// tearDown's resumeWake re-arms after it.
+export async function rearmWake (reason) {
+  if (!wake.ctx || call.state !== 'idle' || wake.starting) return null
+  wake.owned = false // a restarted detector is not paused by this window
+  return armWake(wake.ctx)
+}
+
+export async function checkWake () {
+  if (!wake.ctx || call.state !== 'idle' || wake.starting) return null
+  let s
+  try { s = await wake.ctx.rest('/wake', { method: 'GET' }) } catch { s = null }
+  if (!s || call.state !== 'idle' || wake.starting) return null
+  if (!s.enabled) { wake.status = s; wake.armed = false; return s }
+  if (WAKE_UP.includes(s.state)) { wake.status = s; wake.armed = true; return s }
+  return rearmWake('poll')
+}
+
+function scheduleWakePoll () {
+  stopWakePoll()
+  wake.pollTimer = E().setTimeout(() => {
+    wake.pollTimer = null
+    void Promise.resolve(checkWake()).catch(() => {}).finally(() => { if (wake.ctx) scheduleWakePoll() })
+  }, WAKE_POLL_MS)
+}
+
+function stopWakePoll () {
+  if (wake.pollTimer) { E().clearTimeout(wake.pollTimer); wake.pollTimer = null }
+}
+
+// host.state.gateway (SDK: the gateway WebSocket state, 'idle' | 'connecting' | 'open' | ...).
+// Returns the disposer, or null on an SDK without the atom (the idle check still covers it).
+export function watchGateway () {
+  const g = host.state && host.state.gateway
+  const sub = g && (typeof g.listen === 'function' ? g.listen : typeof g.subscribe === 'function' ? g.subscribe : null)
+  if (!sub) return null
+  let last = typeof g.get === 'function' ? g.get() : null
+  const off = sub.call(g, v => {
+    const was = last
+    last = v
+    if (v === 'open' && was !== 'open') void rearmWake('reconnect')
+  })
+  return typeof off === 'function' ? off : null
 }
 
 // Only this window answers when the setting says so: "desktop" (default) = the Hermes Desktop app;
@@ -2218,8 +2429,16 @@ export default {
     ctx.onEvent('message.delta', onMessageDelta)
     ctx.onEvent('plugin.gemini-live-chat.wake.detected', ev => { void onWakeDetected(ev) }) // v0.7
     void armWake(ctx)
+    // v0.8: re-arm after a gateway restart (socket reconnect, plus a slow idle check).
+    const offGateway = watchGateway()
+    scheduleWakePoll()
     // Disable / unload / hot-reload: hang up and release everything (mic, sockets, peer, audio).
-    ctx.onDispose(() => tearDown())
+    ctx.onDispose(() => {
+      if (offGateway) offGateway()
+      stopWakePoll()
+      tearDown()
+      wake.ctx = null
+    })
     ctx.register({ id: 'talk', area: 'composer.actions', order: 42, render: () => h(VoiceButton, { ctx }) })
     ctx.register({ id: 'status', area: 'statusBar.right', order: 140, render: () => h(StatusChip, {}) })
   }
