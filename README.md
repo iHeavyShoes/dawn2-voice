@@ -82,6 +82,10 @@ Without the key the button is disabled and its tooltip says exactly what to add.
 | `transcript_to_chat` | `chat_turn` | `chat_turn`: one queued turn in the open chat at hang-up + data-folder file. `file`: data folder only. `off`: nothing. |
 | `half_duplex` | `false` | Mute the mic while the voice speaks (loudspeakers that beat echo cancellation). Disables barge-in. |
 | `api_version` | `v1alpha` | API version for the ephemeral token and socket. Both official Google SDKs use `v1alpha` for ephemeral tokens. |
+| `wake_word` | `false` | v0.7: say the wake phrase to start this call on the open chat. Needs Hermes' own wake word off. See [Wake word](#wake-word-v07). |
+| `wake_phrase` | empty | English letters only (`hey ray`). Empty: `hey <persona name>`. |
+| `wake_sensitivity` | `0.5` | 0..1; higher fires more easily (more false wakes). |
+| `wake_surface` | `desktop` | `desktop`: only the Hermes Desktop app answers the wake word. `any`: the first open window (also a browser tab). |
 
 ### Changing the voice, persona and language
 
@@ -357,6 +361,42 @@ gemini-live-chat: voice latency provider=gemini-free brain=hermes kind=turn eos-
 `eos` is the provider's end-of-speech signal, so add `silence_ms` to get "user stopped talking →
 first audio". `kind=abandoned` marks a turn superseded before it got an answer. Compare these lines
 before and after a change; the measured numbers belong here once Ray has a call's worth of lines.
+
+## Wake word (v0.7)
+
+Say **"Hey Ray"** (the persona name; `wake_phrase` to change it) and this plugin's call starts on
+the open chat, with a short "כן?" once it is up. Say **"ביי ריי"**, **"תסיים שיחה"**, **"סיים
+שיחה"**, **"Bye Ray"** or **"end call"** to end it: the voice says "ביי." and the call hangs up
+exactly like the button (transcript saved, microphone released, wake word listening again).
+
+**Why the plugin runs its own detector.** On the gateway's `wake.detected` event the Desktop app
+lets plugins hear it first, then *always* stops its capture, plays the wake sound and starts its own
+voice conversation. No setting and no SDK flag makes core only emit the event, so answering it from
+a plugin would open two voice sessions on one microphone. Instead, with core's wake word **off**,
+the plugin's backend runs the same engine core uses (`tools.wake_word`, sherpa-onnx
+open-vocabulary keyword spotting: any English phrase, no training, local, offline):
+
+1. Each window calls `POST /wake/arm` once; the detector starts if `wake_word` is on (the first
+   start lazy-installs `wake-sherpa` and downloads the ~13 MB model, like core's own first use).
+2. On the phrase the detector **releases the microphone first**, then sends
+   `plugin.gemini-live-chat.wake.detected {token}` to every window.
+3. The first eligible window to `POST /wake/claim` the token starts the call (the open chat, as
+   the button does). Unclaimed for 15 s (no chat open, no Desktop window): it listens again.
+4. A call started from the button calls `/wake/pause` before `getUserMedia` (the mic barrier);
+   every hang-up calls `/wake/resume`, retried while the browser still holds the device.
+
+**End-call phrases.** A turn hangs up only when the whole turn is a goodbye (the `bye` class of the
+turn classifier) *and* holds an explicit phrase: `bye/ביי + <persona name>`, `end call`, `end the
+call`, `hang up`, `סיים שיחה`, `תסיים שיחה`, `סיים/תסיים את השיחה`, `תנתק`. A bare "ביי", "תודה ביי",
+"להתראות", or a sentence that merely contains a phrase ("אל תסיים שיחה", "Bye Ray, but first
+check my calendar") keeps the call up; a request goes to Hermes as usual.
+
+**Limits.** The wake phrase must be English: the keyword model has an English BPE vocabulary, so
+"היי ריי" cannot be enrolled (say "Hey Ray"; the call itself is in Hebrew). The detector listens on
+the gateway host's microphone, so it is for the PC running Hermes; a phone opening the webapp over
+Tailscale cannot be woken (its microphone is not the one listening), and with `wake_surface:
+desktop` a phone tab never answers a PC-side wake. Core's own wake word and this one cannot run at
+once (one microphone lease per machine): turning this on means `wake_word.enabled: false`.
 
 ## How it works
 
