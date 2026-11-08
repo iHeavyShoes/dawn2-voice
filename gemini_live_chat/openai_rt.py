@@ -100,6 +100,11 @@ def _transcription_prompt(cfg: Dict[str, Any]) -> str:
     return hint[:1000]
 
 
+ISRAELI_PRONUNCIATION = ("When speaking Hebrew, use a native Israeli accent and natural Israeli pronunciation, "
+                         "stress and prosody, not an American English accent. Keep Hebrew as Hebrew; "
+                         "do not translate or switch language. When reading English, keep it English.")
+
+
 def build_session(cfg: Dict[str, Any], carry: str = "") -> Dict[str, Any]:
     """The Realtime ``session`` object (GA shape) for ``client_secrets``. *cfg* has the persona
     resolved (``live.resolve_persona``)."""
@@ -115,7 +120,7 @@ def build_session(cfg: Dict[str, Any], carry: str = "") -> Dict[str, Any]:
             "model": cfg.get("openai_model") or DEFAULT_MODEL,
             "instructions": persona.relay_instructions(
                 cfg.get("instructions", ""), name=name, gender=cfg["persona_gender"],
-                name_he=cfg.get("persona_name_he", "")),
+                name_he=cfg.get("persona_name_he", "")) + "\n" + ISRAELI_PRONUNCIATION,
             "audio": {
                 "input": {
                     "noise_reduction": {"type": "near_field"},
@@ -128,7 +133,7 @@ def build_session(cfg: Dict[str, Any], carry: str = "") -> Dict[str, Any]:
                         "interrupt_response": True,
                     },
                 },
-                "output": {"voice": voice},
+                "output": {"voice": voice, "speed": cfg.get("openai_speed", 1.15)},
             },
         }
     return {
@@ -149,7 +154,7 @@ def build_session(cfg: Dict[str, Any], carry: str = "") -> Dict[str, Any]:
                     "interrupt_response": True,
                 },
             },
-            "output": {"voice": voice},
+            "output": {"voice": voice, "speed": cfg.get("openai_speed", 1.15)},
         },
         "tools": tool_definitions(name),
         "tool_choice": "auto",

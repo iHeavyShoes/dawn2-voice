@@ -49,7 +49,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import latency, live, openai_rt, prefs, providers, wake  # noqa: E402
+from gemini_live_chat import ack, latency, live, openai_rt, prefs, providers, wake  # noqa: E402
 
 logger = logging.getLogger("gemini-live-chat")
 router = APIRouter()
@@ -235,6 +235,27 @@ def latency_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if rec is None:
         return {"ok": False}
     logger.info("gemini-live-chat: %s", latency.line(rec))
+    return {"ok": True}
+
+
+@router.post("/ack")
+def flow_ack(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Gemini flow text only; OpenAI uses a tool-free out-of-band text response on its own wire."""
+    body = body if isinstance(body, dict) else {}
+    pid, utterance, previous = body.get("provider"), body.get("utterance"), body.get("previous_sentence", "")
+    if (pid not in (providers.GEMINI_FREE, providers.GEMINI_PAID)
+            or not isinstance(utterance, str) or not 0 < len(utterance) <= ack.MAX_UTTERANCE
+            or not isinstance(previous, str) or len(previous) > ack.MAX_PREVIOUS):
+        return {"text": ""}
+    return ack.generate(_secret(providers.PROVIDERS[pid].secret), utterance, previous)
+
+
+@router.post("/ack/report")
+def flow_ack_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    rec = ack.clean_stats(body)
+    if rec is None:
+        return {"ok": False}
+    logger.info("gemini-live-chat: ack_source=%s ack_latency=%dms", rec["ack_source"], rec["ack_latency"])
     return {"ok": True}
 
 

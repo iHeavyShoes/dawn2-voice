@@ -37,6 +37,27 @@ const PICKER = {
 
 function err (status, detail) { const e = new Error(String(status)); e.detail = detail; return e }
 
+test('picker opens with all providers refused and exposes a direct error recovery action', async () => {
+  const ctx = makeCtx({ status: () => ({ available: false, message: 'quota', picker: { choice: 'gemini-free', options: PICKER.options.map(o => ({ ...o, state: 'refused' })) } }),
+    mint: async () => { throw err(503, { reason: 'unavailable', message: 'All providers refused' }) } })
+  const registered = []
+  P.default.register({ ...ctx, onEvent: () => {}, onDispose: () => {}, register: r => registered.push(r) })
+  const render = registered.find(r => r.id === 'talk').render()
+  const voice = render[0](render[1])
+  const pickerElement = voice.at(-1)
+  const picker = pickerElement[0](pickerElement[1])
+  const trigger = picker[2]
+  assert.equal(trigger[1].asChild, undefined, 'the SDK renders its own button: no nested button')
+  trigger[1].onClick()
+  assert.equal(P.ui.open, true)
+  P.ui.open = false
+  await P.start(ctx)
+  const n = sdk.notes.at(-1)
+  assert.ok(n.action, 'failure offers the picker directly')
+  n.action.onClick()
+  assert.equal(P.ui.open, true)
+})
+
 test('402 and billing texts are "billing"; plain quota stays "quota"', () => {
   assert.equal(P.failureReason('Payment Required', 402), 'billing')
   assert.equal(P.failureReason('RESOURCE_EXHAUSTED: billing account has no prepaid credit', 429), 'billing')

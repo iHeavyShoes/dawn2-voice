@@ -158,7 +158,11 @@ test('gemini: a substantive turn goes to Hermes, and the voice model\'s own answ
   assert.equal(sub.length, 1)
   assert.equal(sub[0].params.text, 'מה נשאר לעשות בסשן הזה?')
   assert.ok(sub[0].params.voice_context.startsWith(P.STYLE_NOTE), 'the fast-answer note leads the voice context')
-  assert.match(P.STYLE_NOTE, /Answer first in one short spoken sentence, then add detail only if needed\. Don't deliberate at length unless the question requires it\./)
+  assert.match(P.STYLE_NOTE, /bottom line in 1–2 spoken sentences/)
+  assert.match(P.STYLE_NOTE, /רוצה פירוט/)
+  assert.match(P.STYLE_NOTE, /תקריא הכל/)
+  assert.match(P.STYLE_NOTE, /don't plan the whole long answer before starting/)
+  assert.match(P.STYLE_NOTE, /An acknowledgement was already spoken; start your reply with the content itself/)
   assert.equal(played(), 0, 'the voice model\'s free answer was not played')
   assert.ok(!P.call.turns.some(x => /probably yes/.test(x.text)), 'nor recorded')
   assert.deepEqual(P.call.turns, [{ role: 'user', text: 'מה נשאר לעשות בסשן הזה?' }])
@@ -207,7 +211,7 @@ function codexUser (dc, text) {
   dc.serve({ type: 'input_audio_buffer.speech_stopped' })
   dc.serve({ type: 'conversation.item.input_audio_transcription.completed', transcript: text })
 }
-const readings = dc => dc.sent.filter(m => m.type === 'response.create')
+const readings = dc => dc.sent.filter(m => m.type === 'response.create' && m.response?.metadata?.glc !== 'ack')
 
 test('openai-codex: delegation of every substantive turn; responses only ever read Hermes\' text, out of band', async () => {
   const dc = await codexCall()
@@ -437,10 +441,10 @@ test('one latency line per turn: numbers from end-of-speech, no content, also po
   ws.serve({ serverContent: { turnComplete: true } })
   ws.serve({ serverContent: { modelTurn: { parts: [AUDIO] } } }) // first answer audio at +2200
   await settle()
-  const line = logs.find(l => l.includes('latency'))
+  const line = logs.find(l => l.includes('] latency '))
   assert.ok(line, 'logged')
   const rec = JSON.parse(line.slice(line.indexOf('{')))
-  assert.deepEqual(rec, { provider: 'gemini-free', brain: 'hermes', kind: 'turn', silence_ms: 1000, ack: false, submit: 400, first_text: 1700, first_audio: 2200, first_answer_audio: 2200 })
+  assert.deepEqual(rec, { provider: 'gemini-free', brain: 'hermes', kind: 'turn', silence_ms: 1000, ack: false, eos_source: 'model_turn', submit: 400, first_text: 1700, first_audio: 2200, first_answer_audio: 2200 })
   assert.ok(!line.includes('left') && !line.includes('Tests'))
   const posted = ctx.rests.find(r => r.path === '/latency')
   assert.deepEqual(posted.opts.body, rec)

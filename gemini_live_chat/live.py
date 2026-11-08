@@ -146,6 +146,7 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "providers": _providers(raw.get("providers"), problems),
         "openai_model": str(pick("openai_model", _valid_openai_model, _OPENAI_DEFAULT_MODEL)).strip(),
         "openai_voice": pick("openai_voice", lambda v: v == AUTO or v in _OPENAI_VOICES, AUTO),
+        "openai_speed": _float_in(None if isinstance(raw.get("openai_speed"), bool) else raw.get("openai_speed"), 1.15, (.25, 1.5)),
         # v0.7: the plugin's own wake word (off by default; see gemini_live_chat/wake.py).
         "wake_word": raw.get("wake_word") is True or str(raw.get("wake_word")).strip().lower() in ("true", "on", "yes", "1"),
         "wake_phrase": _wake_phrase(raw.get("wake_phrase"), problems),

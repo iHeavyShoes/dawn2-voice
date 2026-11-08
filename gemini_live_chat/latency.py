@@ -48,6 +48,8 @@ def clean(body: Any) -> Optional[Dict[str, Any]]:
         "silence_ms": _ms(body.get("silence_ms")),
         "ack": body.get("ack") is True,
     }
+    if body.get('eos_source') in ('voice_activity', 'model_turn', 'speech_stopped', 'transcript_idle', 'unknown'):
+        out['eos_source'] = body['eos_source']
     for field in FIELDS:
         out[field] = _ms(body.get(field))
     if all(out[f] is None for f in FIELDS):
@@ -63,4 +65,6 @@ def line(rec: Dict[str, Any]) -> str:
     parts += [f"eos->{f}={fmt(rec[f])}" for f in FIELDS]
     parts.append(f"ack={'yes' if rec['ack'] else 'no'}")
     parts.append(f"silence_ms={rec['silence_ms'] if rec['silence_ms'] is not None else '-'}")
+    if "eos_source" in rec:
+        parts.append(f"eos_source={rec['eos_source']}")
     return " ".join(parts)
