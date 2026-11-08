@@ -1,5 +1,5 @@
 name: gemini-live-chat
-version: "0.8.0"
+version: "0.9.0"
 manifest_version: 1
 kind: standalone
 description: "Full-duplex live voice in Hermes Desktop that delegates every real request into the chat you have open (prompt.submit, surface voice-live, with the recent spoken turns as voice_context), so nothing said on the call is lost. Runs on a provider chain with automatic fallback, also mid-call: Gemini Live on a free key, then OpenAI Realtime on your ChatGPT/Codex sign-in, then Gemini Live on a paid key. Hebrew-first with live language switching, barge-in, transcript saved to the chat at hang-up, and a stop path that leaves no socket, peer connection, microphone or process behind. No credential reaches the renderer: it gets a single-use, setup-locked Gemini token or a short-lived OpenAI client secret that Hermes core signed for."
@@ -28,6 +28,7 @@ config_schema:
   providers: {type: str, default: "gemini-free,openai-codex,gemini-paid", label: "Voice providers (in order)", description: "Comma-separated fallback chain: gemini-free (GEMINI_API_KEY), openai-codex (your ChatGPT/Codex sign-in in Hermes), gemini-paid (GEMINI_API_KEY_PAID). The first that can serve takes the call; on quota, auth or connection failure (also mid-call) the call moves to the next."}
   openai_model: {type: str, default: "gpt-realtime-2.1", label: "OpenAI Realtime model", description: "Model for the openai-codex provider (gpt-realtime-*)"}
   openai_voice: {type: str, default: "auto", label: "OpenAI voice", description: "auto (cedar for a male persona, marin for a female one) or an OpenAI Realtime voice: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar"}
+  openai_speed: {type: float, default: 1.15, label: "OpenAI speech speed", description: "0.25–1.5. OpenAI Realtime audio output speed; applied at the start of the next call, never mid-response."}
   model: {type: str, default: "gemini-3.8-live", label: "Live model", description: "Gemini Live model id. gemini-3.8-live is the most reliable at delegating; -extended-thinking delegates far less often."}
   voice: {type: str, default: "auto", label: "Voice", description: "auto (Charon for a male persona, Aoede for a female one) or a Gemini prebuilt voice name (male: Charon, Puck, Fenrir, Orus, ...; female: Aoede, Kore, Leda, Zephyr, ...)"}
   persona_name: {type: str, default: "", label: "Persona name", description: "Who the voice is. Empty: the agent name from this profile's SOUL.md (e.g. Ray), else Hermes. Only the name is sent to Google."}

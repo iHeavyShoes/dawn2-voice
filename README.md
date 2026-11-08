@@ -72,6 +72,7 @@ Without the key the button is disabled and its tooltip says exactly what to add.
 | `providers` | `gemini-free,openai-codex,gemini-paid` | The fallback chain, in order. Drop an id to never use it. |
 | `openai_model` | `gpt-realtime-2.1` | OpenAI Realtime model for `openai-codex` (`gpt-realtime*`). |
 | `openai_voice` | `auto` | `auto`: `cedar` (male) or `marin` (female) by the persona. Or `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar`. |
+| `openai_speed` | `1.15` | OpenAI Realtime `session.audio.output.speed`, range 0.25–1.5, applied at the next call. Hebrew readout requests native Israeli pronunciation; accent quality is model-dependent and unverified. Gemini remains first in the default chain. |
 | `model` | `gemini-3.8-live` | Live model. `gemini-3.8-live` delegates reliably; `-extended-thinking` decides to answer itself about 3 times in 5 (measured by hermes-gemini-live). |
 | `voice` | `auto` | `auto`: `Charon` (male) or `Aoede` (female) by the persona's gender. Or any Gemini prebuilt voice: male `Charon`, `Puck`, `Fenrir`, `Orus`, `Iapetus`, ...; female `Aoede`, `Kore`, `Leda`, `Zephyr`, ... Unknown names fall back to `auto`. |
 | `persona_name` | empty | Who the voice is. Empty: the agent name from this profile's `SOUL.md` (`You are Ray (in Hebrew exactly ריי)` gives `Ray`/`ריי`), else `Hermes`. |
@@ -330,23 +331,40 @@ already read: every sentence not yet read is read, and none is read twice (the f
 guarantee). A silent reply (`[SILENT]`, `NO_REPLY`) is never read. Long replies are capped as
 before, ending with "the rest is in the chat".
 
-**Ack (v0.8).** If Hermes has not produced its first sentence 900 ms after the turn was submitted, the
-voice says one short acknowledgement, like a person would ("רגע", "שנייה, בוא נראה", "הממ, רגע",
-"Hmm, let me see"). On a fast answer (first sentence within 900 ms) nothing is said before it.
+**Ack (v0.9).** A model may write a **flow-only** reaction; never the answer. The only input is
+this last user utterance (up to 2000 characters) and the previous Hermes sentence (up to 400),
+with a separate hard prompt: max six words, user's language, no facts/opinions/names/numbers/promises,
+no verbatim echo. No tools, history, SOUL or voice transcript is included in this request.
 
-*How it is made (design choice).* The ack is picked **locally in the renderer** from a phrase bank
-(`ACK_BANK`, 29 Hebrew and 28 English phrases); the voice model never writes it, so it cannot
-answer, guess or promise. A model-written ack was rejected: even a "≤8 words, never answer" prompt
-leaks content now and then, and the guard would then have to drop it after the fact.
-
-- About one turn in three (`ACK_ECHO_ODDS`, never twice in a row) the ack echoes 1–3 words copied
-  from the user's own transcript ("אה, ביומן מחר, שנייה."); the topic is rule-based (`ackTopic`: the
-  first content words, skipping question/request words, pronouns, the persona's name and digits).
-- Silence is a valid ack: on a short turn that asks for no work (likely fast) it is sometimes skipped.
-- Never the same phrase within the last 5 acks; "good question" only after a question; Hebrew forms
-  follow `persona_gender`; the bare "בודק" is rare (low weight), not the default.
-- A guard (`verifyAck`) drops any ack longer than 8 words or with a word that is neither the bank's
-  nor the user's own, so no new fact, number, time or name can be spoken.
+- OpenAI: an out-of-band `response.create` on the serving connection (`conversation: "none"`,
+  `output_modalities: ["text"]`, `tools: []`, explicit input). Text-only responses are never played
+  and never change the main reading's state. Optional ack errors do not fail over the call.
+- Gemini: Live is audio-only, so there is **no text-only request to the Live model**. Instead the
+  backend calls `gemini-3.8-flash:generateContent` using the serving Gemini key tier, on the same
+  Google host. This is an extra small model request (quota/billing applies), not a second Live
+  connection. If that model is unavailable or slow, the phrase bank serves. This deliberate
+  provider-contract adjustment is not a claim that Gemini Live can produce guarded text alone.
+- Generation has a **600ms** deadline. Playback waits until **900ms** after submit. Any Hermes
+  text (even an unfinished first sentence), user speech, provider switch or hang-up preempts it.
+  Generation never holds up `prompt.submit` or Hermes' text. Late model output cannot ack twice.
+- The guard strips niqqud/foreign script, rejects >6 words, all digits/times, an echo of three
+  consecutive user words, and any word outside a conservative flow-only vocabulary. It does not
+  admit user vocabulary merely because the user mentioned it: names/facts still fail. This favors
+  safe bank fallbacks over permissive model prose; it is not a semantic guarantee for arbitrary text.
+- No rule-based topic echo. The old 29-he / 28-en bank remains the fallback; recent five exclusions,
+  gender forms and low weight for “checking” remain. About **one in four turns is silent**, even
+  on slow requests. Clearly unfinished turns (connector tail or <3 words) get no ack; potentially
+  substantive fragments may merge in one additional 400ms classifier window. Known commands and
+  backchannels stay instant. An ack is never resumed after a backchannel.
+- A playing ack is cut on speech or Hermes text. Gemini's generated tail is muted until its
+  `turnComplete` before a queued reading is handed over (no Gemini `response.cancel` exists);
+  OpenAI cancels and clears its audio buffer. This prevents overlap, but provider turnover can
+  still add latency. A genuinely substantive barge-in drops the remaining answer, intentionally;
+  that answer remains in the chat.
+- Tuning lines contain only `ack_source=model|bank|silence|dropped(reason)` and `ack_latency`
+  (generation/selection milliseconds). Drops are logged separately from a chosen fallback.
+  No utterance, ack, previous sentence or vendor error is logged. Actual provider latency and
+  accent quality still require a live call; fake-wire tests do not establish either.
 
 **Speaker labels (v0.8).** A leading `<persona>:` label on a line of Hermes' reply ("ריי: כן, זה
 אפשרי", `**Ray:**`, also `Hermes:`) is stripped before the text reaches the voice, and a piece that
@@ -358,12 +376,12 @@ resumes it. Anything substantive drops it and goes to Hermes as a new turn on th
 core queues it after, or steers, the running turn, so it acts as a follow-up or correction).
 "Stop" drops everything queued.
 
-**Fast-answer hint.** Each delegated turn adds a model-only line to `voice_context`: *answer first
-in one short spoken sentence, then add detail only if needed; don't deliberate at length unless
-the question requires it.* `prompt.submit` has no per-turn reasoning-effort field (it reads
-`text`, `surface`, `voice_context`, `voice_turn` and display fields; `reasoning_effort` is only a
-per-session override on session create, which would change the chat for typed turns too), so the
-note is the only hint. The model is not changed.
+**Fast-answer hint (v0.9).** Each delegated turn adds a model-only line to `voice_context`:
+when the full answer would be long, give the bottom line in 1–2 spoken sentences, stop and offer
+“רוצה פירוט?”. Read the full version only on request (“תקריא הכל”). Write the bottom line first;
+do not plan a full long answer before starting. Start directly with content, without a second
+opener (“בסדר”, “מבין”, “כן”); the flow layer already supplies any needed acknowledgement.
+`prompt.submit` has no per-turn reasoning-effort field, so this remains a hint, not a model switch.
 
 **Latency trade-off.** Every substantive turn waits for the chat model instead of a voice model
 that answers in about 0.5 s. Baseline before streaming (agent.log, prompt received → reply ready,
@@ -379,8 +397,15 @@ prefer speed over always getting the chat model's answer, set `brain: voice`.
 gemini-live-chat: voice latency provider=gemini-free brain=hermes kind=turn eos->submit=412ms eos->first_text=2310ms eos->first_audio=1310ms eos->first_answer_audio=2890ms ack=yes silence_ms=1000
 ```
 
-`eos` is the provider's end-of-speech signal, so add `silence_ms` to get "user stopped talking →
-first audio". `kind=abandoned` marks a turn superseded before it got an answer. Compare these lines
+New lines append `eos_source`. `voice_activity` (Gemini `ACTIVITY_END`), `model_turn` and
+`speech_stopped` (OpenAI) identify provider events; `transcript_idle` explicitly identifies the
+inferred fallback, whose anchor is the last transcript chunk, **not** a measured EOS. Add
+`silence_ms` only when comparing a true VAD end to the physical end of speech. Gemini takes the
+400ms transcript-lag path on `voiceActivity.ACTIVITY_END` even if its silent relay emits no model
+output. When no provider EOS arrives, the fallback now waits `silence_ms + 400` instead of
+`silence_ms + 1500` (default 1400ms rather than 2500ms from the last transcript chunk). It is not
+reported as a 400ms measured EOS. OpenAI still waits for the **final** input transcription: an
+incomplete transcript may change, so a 400ms submit is not guaranteed there. `kind=abandoned` marks a turn superseded before it got an answer. Compare these lines
 before and after a change; the measured numbers belong here once Ray has a call's worth of lines.
 
 ## Wake word (v0.7)
@@ -464,7 +489,9 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
   renderer opens a WebSocket to the same host. OpenAI: Hermes core calls
   `api.openai.com/v1/realtime/client_secrets` for the plugin (`requires_auth: openai-codex`) and
   the renderer opens WebRTC to `api.openai.com`. Audio goes to the serving provider; after a
-  switch the recent spoken turns also go to the next one. Nothing else leaves the machine.
+  switch the recent spoken turns also go to the next one. A flow ack additionally sends only the
+  last utterance + previous Hermes sentence to Gemini Flash on the same Google host (or an
+  out-of-band text response on the serving OpenAI connection). No new destination is used.
 - Reads: `GEMINI_API_KEY` and `GEMINI_API_KEY_PAID` through Hermes' secret scope, this plugin's own settings, and the first
   16 KB of the profile's `SOUL.md` to take the agent's **name** (and an explicitly stated gender).
   Only the name is sent to the voice provider; the SOUL text is not. The Codex token is never
@@ -474,6 +501,25 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
 - No shell commands, no background processes, no telemetry, no self-update.
 
 ### Issue log
+
+- **v0.9.0: previous/first-sentence readout repeated.** Two reproducible client defects: terminal
+  `response_reused` was treated as a fresh answer after the stream was destroyed, and re-sent
+  `message.start` / delta frames reset or appended the sentence ledger. The client now honors
+  the reuse flag, `turn_id` / segment / UTF-16 offset identities and committed final-row ids,
+  while preserving legitimate identical text from distinct turns and explicit “repeat”. These
+  reproduce the reported symptoms offline; the particular deployed call has not been traced.
+- **v0.9.0: picker could not recover from a pinned exhausted free tier.** The chevron used an
+  `asChild` wrapper with another button inside the SDK trigger. It now uses the trigger's own
+  button with an explicit click handler, never disabled by call availability. Right-click is on
+  the outer group; an obvious “Gemini free only” / “Gemini paid only” / “ChatGPT only” label shows
+  a pin. Quota/connect errors offer the picker; the pinned “Use Auto” action also opens it. Merely
+  opening it does not save a choice. No evidence identifies who/what made the earlier pin, and
+  no automatic migration changes existing choices. Real Desktop acceptance is pending Ray.
+- **v0.9.0: 2500ms submit path.** The silent Gemini relay can emit no model-turn EOS, activating
+  the old `silence_ms + 1500` timeout. The new documented `voiceActivity.ACTIVITY_END` path takes
+  400ms; fallback is reduced and labeled inferred as described above. No claim that a restart
+  changed a setting, or that the real call is fixed, without Ray's post-deploy latency lines.
+
 
 - **v0.8.0 (2026-11-08): "Hey Ray" stopped working after a gateway restart** until the Desktop
   plugins were rescanned. Cause: the detector lives in the gateway process and was armed only by
@@ -509,12 +555,23 @@ After updating `plugin.js`, a Webapp tab needs **⌘K → Reload desktop plugins
   are short JSON request/response calls, so this does not affect it; the audio stream itself goes
   straight from the renderer to Google.
 
+## Deploying 0.9.0
+
+Use the supplied local commit script (no push). It preserves the abandoned phone-wake backend
+on a separate `wip-phone-wake` branch with one WIP commit, based on 0.8.0; release branch
+`v0.9-calls` contains no phone detector or `wake_phone` setting. Existing PC wake/end-call phrases
+are unchanged. End any active call, install the release package, **restart the gateway** to load
+the new Python ack routes/settings, then reload Desktop plugins (and reload the webapp tab).
+There is no Hermes source patch or Desktop rebuild. Ray must validate the real picker (including
+all providers refused), pin recovery, Gemini/ash speech, no repeated readout and `eos_source`
+latency lines. The unit tests do not substitute for that acceptance.
+
 ## Development
 
 ```
 pip install -r requirements-dev.txt   # test-only: pytest, fastapi, httpx
-python -m pytest -q                   # 151 tests: minting, chain, fallback, routes, persona, wake word, restart
-node --test 'tests/js/*.test.mjs'     # 124 tests: delegation, hand-off, barge-in, transcript, transports, wake, ack, labels
+python -m pytest -q                   # 156 tests: minting, chain, fallback, routes, persona, wake word, restart
+node --test 'tests/js/*.test.mjs'     # 136 tests: delegation, hand-off, barge-in, transcript, transports, wake, guarded ack, recovery
 hermes plugins validate . --install-deps
 ```
 

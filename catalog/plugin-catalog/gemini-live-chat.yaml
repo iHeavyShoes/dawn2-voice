@@ -21,7 +21,9 @@ description: >-
   (requires_auth: openai-codex; the plugin never sees the Codex token). Disclosure — pressing the
   call button captures microphone audio and streams it from the renderer to the serving provider:
   generativelanguage.googleapis.com (Gemini) or api.openai.com (OpenAI Realtime, WebRTC). The
-  backend calls the same hosts to mint sessions. Delegated requests, Hermes' answers (as text) and
+  backend calls the same hosts to mint sessions and generates a guarded flow ack with Gemini
+  Flash (last user utterance plus previous Hermes sentence only); OpenAI uses an out-of-band text
+  response on its serving connection. Delegated requests, Hermes' answers (as text) and
   the recent spoken turns are sent to the serving provider; after a provider switch, the recent
   spoken turns are also sent to the next one. The profile's SOUL.md is read only for the agent's
   name, which is the only part sent. Call transcripts are written to the plugin's Desktop data
@@ -29,7 +31,7 @@ description: >-
   processes or telemetry.
 maintainer: OWNER
 tier: community
-version: "0.8.0"
+version: "0.9.0"
 category: voice
 docs_url: https://github.com/OWNER/gemini-live-chat#readme
 requires_hermes: ">=0.21.5"
