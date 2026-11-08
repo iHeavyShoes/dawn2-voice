@@ -41,6 +41,8 @@ DEFAULT_SENSITIVITY = 0.5
 #: sherpa's keyword model is English (BPE vocabulary): a phrase must be Latin letters.
 PHRASE_RE = re.compile(r"^[a-z][a-z' ]{1,38}[a-z]$")
 STATES = ("off", "arming", "listening", "paused", "error", "unsupported")
+CORE_WAKE_ON_MESSAGE = ("Hermes' own wake word is on (wake_word.enabled: true) and holds the microphone. "
+                        "Turn it off so this plugin can listen.")
 
 
 def engine_config(phrase: str, sensitivity: float, input_device: Any = None) -> Dict[str, Any]:
@@ -101,6 +103,40 @@ class WakeManager:
         self._token_at = 0.0
         self._gen = 0  # bumped by every arm/disarm; stale worker threads back out
         self.detections = 0
+        self.auto_armed = False  # v0.8: the gateway-side arm ran once in this process
+
+    # ── v0.8: arm without a window (gateway restart) ────────────────────────────────────────────
+
+    def auto_arm(self, phrase: str, sensitivity: float = DEFAULT_SENSITIVITY,
+                 core_wake_on: bool = False, reason: str = "startup") -> Dict[str, Any]:
+        """Arm once per process without waiting for a renderer: the gateway restarted, the old
+        detector died with it, and an already-loaded window will not call ``/wake/arm`` again.
+
+        Never disarms (only the explicit ``/wake/arm`` route does). Idempotent: a detector that is
+        already arming, listening or paused (a call holds the mic) is left alone. When Hermes' own
+        wake word is on, the microphone is not touched at all (one mic lease per machine)."""
+        with self._lock:
+            if self.auto_armed:
+                return self._status_locked()
+            self.auto_armed = True
+            busy = self.state in ("arming", "listening", "paused")
+        if busy:
+            return self.status()
+        if core_wake_on:
+            self.refuse(CORE_WAKE_ON_MESSAGE)
+            logger.warning("gemini-live-chat: wake word not armed (%s): %s", reason, CORE_WAKE_ON_MESSAGE)
+            return self.status()
+        logger.info("gemini-live-chat: arming the wake word on %s", reason)
+        return self.arm(phrase, sensitivity)
+
+    def refuse(self, msg: str) -> Dict[str, Any]:
+        """Report why the detector is not armed without touching the engine. An active detector is
+        left running (it already holds the lease)."""
+        with self._lock:
+            if self.state not in ("arming", "listening", "paused"):
+                self._gen += 1
+                self.state, self.error, self._key, self._token = "error", msg, None, None
+            return self._status_locked()
 
     # ── status ──────────────────────────────────────────────────────────────────────────────────
 

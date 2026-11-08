@@ -171,6 +171,7 @@ def _picker(cfg: Dict[str, Any], src: providers.Sources, p: prefs.Prefs) -> Dict
 
 @router.get("/status")
 def status() -> Dict[str, Any]:
+    _auto_arm("first request")
     cfg = _settings()
     src = _sources()
     p = _prefs()
@@ -249,22 +250,75 @@ def _wake_status(m: "wake.WakeManager", cfg: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _core_wake_on() -> bool:
+    """Hermes' own wake word (``wake_word.enabled`` in this profile's config). When it is on, core
+    owns the one microphone lease, so this plugin must not open the mic (one-mic rule)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        section = (load_config_readonly() or {}).get("wake_word")
+    except Exception:  # outside Hermes (tests) or unreadable: nothing says core is listening
+        return False
+    return isinstance(section, dict) and section.get("enabled") is True
+
+
+def _auto_arm(reason: str) -> None:
+    """v0.8: arm the detector in this process without waiting for a window (a gateway restart
+    killed the old one, and an already-loaded renderer does not call ``/wake/arm`` again).
+
+    Runs at most once per process once the setting is on (``WakeManager.auto_arm``); while the
+    setting is off or unreadable it does nothing and a later route call tries again. Never raises."""
+    try:
+        m = wake.manager()
+        if m.auto_armed:
+            return
+        cfg = _settings()
+        if not cfg.get("wake_word"):
+            return
+        m.auto_arm(live.effective_wake_phrase(cfg), cfg.get("wake_sensitivity", live.DEFAULT_WAKE_SENSITIVITY),
+                   core_wake_on=_core_wake_on(), reason=reason)
+    except Exception:
+        logger.warning("gemini-live-chat: wake word auto-arm failed", exc_info=True)
+
+
 @router.get("/wake")
 def wake_status() -> Dict[str, Any]:
+    _auto_arm("first request")  # lazy path (plugin host isolation imports this module on demand)
     return _wake_status(wake.manager(), _settings())
 
 
 @router.post("/wake/arm")
 def wake_arm() -> Dict[str, Any]:
     """Start listening when the ``wake_word`` setting is on (idempotent); disarm when it is off, so a
-    settings change applies on the next window load. The renderer calls this once per window."""
+    settings change applies on the next window load. The renderer calls this at load, after a
+    gateway reconnect, and when its idle poll finds the detector down (never during a call)."""
     cfg = _settings()
     m = wake.manager()
     if not cfg.get("wake_word"):
         m.disarm()
+    elif _core_wake_on():
+        m.refuse(wake.CORE_WAKE_ON_MESSAGE)
     else:
         m.arm(live.effective_wake_phrase(cfg), cfg.get("wake_sensitivity", live.DEFAULT_WAKE_SENSITIVITY))
     return _wake_status(m, cfg)
+
+
+def _in_hermes() -> bool:
+    try:
+        import hermes_cli.config  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _arm_on_mount() -> None:
+    """Route mount = this module's import by the gateway (``_mount_one_plugin_api``). Arm in the
+    background so a slow first engine build never delays the server start. Outside Hermes (tests,
+    ``hermes plugins validate``) nothing runs."""
+    if _in_hermes():
+        wake._spawn(lambda: _auto_arm("startup"), "glc-wake-auto-arm")
+
+
+_arm_on_mount()
 
 
 @router.post("/wake/claim")
