@@ -211,7 +211,7 @@ function codexUser (dc, text) {
   dc.serve({ type: 'input_audio_buffer.speech_stopped' })
   dc.serve({ type: 'conversation.item.input_audio_transcription.completed', transcript: text })
 }
-const readings = dc => dc.sent.filter(m => m.type === 'response.create' && m.response?.metadata?.glc !== 'ack')
+const readings = dc => dc.sent.filter(m => m.type === 'response.create' && m.response?.metadata?.d2v !== 'ack')
 
 test('openai-codex: delegation of every substantive turn; responses only ever read Hermes\' text, out of band', async () => {
   const dc = await codexCall()

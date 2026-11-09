@@ -6,6 +6,7 @@ const P = await loadPlugin(sdk)
 let ledger, timers, now
 beforeEach(async () => {
   P.tearDown(); await settle()
+  P.resetAckMemory() // a phrase acked in one test is "recent" (never repeated) in the next
   const e = makeEnv(); ledger = e.ledger; timers = new Map(); now = 10000
   P.setEnv({ ...e.env, now: () => now, random: () => .99, log: () => {},
     setTimeout: (fn, ms) => { const id = Symbol(); timers.set(id, { fn, ms }); return id }, clearTimeout: id => timers.delete(id) })
@@ -128,6 +129,63 @@ test('Hermes text cuts a playing ack before queuing its own audio', async () => 
   assert.ok(!P.call.queue.some(i => i.kind === 'ack'))
 })
 
+// 1.0 regression (9.11 call): the reply's first sentence was lost after a preempted ack. Gemini
+// never produced a turn for the ack, so the "muted" mark meant for the ack's tail stayed set and
+// swallowed the first sentence's audio; the voice started at the second sentence.
+const S1 = 'הייתי מאחד הכל לחשבון אחד, החשבון הראשי Zorro7K42, ונותן לו את השם BlueFoxes.'
+const S2 = 'ככה הכל תחת שם אחד.'
+test('1.0: the first sentence is always spoken after a preempted ack (Gemini, the ack turn never comes)', async () => {
+  const ws = await start({ rest: async () => ({ text: 'אה, הבנתי, רגע.' }) })
+  P.onUserTurn('מה דעתך על החשבונות שלי', now)
+  await settle(); fire(900)
+  assert.equal(says(ws).at(-1), '[Say aloud] אה, הבנתי, רגע.')
+  P.onMessageStart(ev({ turn_id: 'r1' }))
+  P.onMessageDelta(ev({ turn_id: 'r1', text: S1 + ' ' + S2 + ' ' }))
+  P.onMessageComplete(ev({ turn_id: 'r1', text: S1 + ' ' + S2 }))
+  fire(1000) // the flush retry; nothing from Gemini for the dropped ack
+  now += 8000; fire(1000) // AWAIT_MS passes
+  assert.equal(says(ws).at(-1), `[Say aloud] ${S1} ${S2}`, 'both sentences handed, first one first')
+  ws.serve({ serverContent: { modelTurn: { parts: [AUDIO] } } })
+  assert.equal(P.call.owner, 'hermes', 'the first sentence is played, not muted')
+  assert.ok(ledger.contexts.some(c => c.sources.some(s => !s.stopped)))
+})
+
+test('1.0: the first sentence is always spoken after a preempted ack (Gemini, the ack tail arrives late)', async () => {
+  const ws = await start({ rest: async () => ({ text: 'אה, הבנתי, רגע.' }) })
+  P.onUserTurn('מה דעתך על החשבונות שלי', now)
+  await settle(); fire(900)
+  P.onMessageDelta(ev({ text: S1 + ' ' }))
+  ws.serve({ serverContent: { modelTurn: { parts: [AUDIO] } } }) // the ack's tail: muted
+  ws.serve({ serverContent: { turnComplete: true } })
+  assert.equal(says(ws).at(-1), `[Say aloud] ${S1}`)
+  ws.serve({ serverContent: { modelTurn: { parts: [AUDIO] } } })
+  assert.equal(P.call.owner, 'hermes')
+})
+
+test('1.0: OpenAI: the late end of a cancelled ack response never skips the first sentence', async () => {
+  const dc = await codex()
+  P.onUserTurn('please check what changed in the project', now)
+  const req = dc.sent.find(x => x.type === 'response.create')
+  dc.serve({ type: 'response.done', response: { id: 'ackm', metadata: req.response.metadata, status: 'completed', output: [{ content: [{ type: 'output_text', text: 'Ah, let me see.' }] }] } })
+  fire(900)
+  const sayReqs = () => dc.sent.filter(x => x.response?.metadata?.d2v === 'say')
+  const ackSay = sayReqs().at(-1)
+  dc.serve({ type: 'response.created', response: { id: 'r-ack', metadata: ackSay.response.metadata } })
+  dc.serve({ type: 'output_audio_buffer.started' })
+  P.onMessageDelta(ev({ text: 'The first sentence is the bottom line. ' }))
+  dc.serve({ type: 'output_audio_buffer.cleared' })
+  dc.serve({ type: 'response.done', response: { id: 'r-ack', metadata: ackSay.response.metadata, status: 'cancelled' } })
+  const first = sayReqs().at(-1)
+  assert.equal(first.response.input[0].content[0].text, 'The first sentence is the bottom line.')
+  dc.serve({ type: 'response.created', response: { id: 'r-1', metadata: first.response.metadata } })
+  P.onMessageDelta(ev({ text: 'Second sentence. ' }))
+  // a duplicate late done of the cancelled ack must not end the first sentence's reading
+  dc.serve({ type: 'response.done', response: { id: 'r-ack', metadata: ackSay.response.metadata, status: 'cancelled' } })
+  assert.equal(sayReqs().at(-1), first, 'the second sentence waits for the first')
+  dc.serve({ type: 'response.done', response: { id: 'r-1', metadata: first.response.metadata, status: 'completed' } })
+  assert.equal(sayReqs().at(-1).response.input[0].content[0].text, 'Second sentence.')
+})
+
 async function codex () {
   await P.start(makeCtx({ mint: async () => ({ provider: 'openai-codex', transport: 'openai-realtime', brain: 'hermes', client_secret: 'test-ephemeral', offer_url: 'https://api.openai.com/v1/realtime/calls' }) }))
   await settle()
@@ -184,7 +242,10 @@ test('provider release cancels a pending model ack; late text cannot leak to the
   let resolve
   const ws = await start({ rest: path => path === '/ack' ? new Promise(r => { resolve = r }) : Promise.resolve({}) })
   P.onUserTurn('תבדוק מה השתנה מאז הפעם האחרונה', now)
-  await P.failover('network', 'switch')
+  // 1.0: a network failure first reconnects the same provider after a backoff (a fake timer here)
+  void P.failover('network', 'switch')
+  await settle()
+  assert.ok(P.call.retryTimer != null, 'waiting to reconnect')
   assert.equal(P.call.ackRequest, null, 'release cancels before any old deadline fires')
   resolve({ text: 'אה, הבנתי, רגע.' }); await settle()
   fire(600); fire(900)

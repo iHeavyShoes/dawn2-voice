@@ -328,18 +328,160 @@ test('codex: a refused SDP exchange (429) fails over at connect time', async () 
   assertReleased()
 })
 
-test('codex: a failed peer connection mid-call fails over; switching is bounded per call', async () => {
-  const ctx = chainCtx(CODEX, CODEX, CODEX, CODEX, CODEX)
+// The same-provider backoff timer (1.0) fires only when a test says so.
+async function fireRetry () {
+  const id = P.call.retryTimer
+  const fn = id != null && ledger.timers.get(id)
+  if (!fn) return false
+  ledger.timers.delete(id)
+  fn()
+  await settle(10)
+  return true
+}
+
+test('codex: a failed peer connection reconnects, then fails over; both are bounded per call', async () => {
+  const ctx = chainCtx(...Array(20).fill(CODEX))
   await codexCall(ctx)
-  for (let i = 0; i < 5; i++) {
-    const pc = ledger.peers.at(-1)
-    if (P.call.state === 'idle') break
-    pc.fail()
+  for (let i = 0; i < 20 && P.call.state !== 'idle'; i++) {
+    ledger.peers.at(-1).fail()
     await settle(10)
+    await fireRetry()
     if (P.call.state !== 'idle') { ledger.peers.at(-1).dc.open(); await settle() }
   }
   assert.equal(P.call.state, 'idle')
-  assert.equal(ctx.bodies.length, 1 + P.MAX_SWITCHES)
+  assert.equal(ctx.bodies.filter(b => b && b.reconnect).length, P.MAX_RECONNECTS)
+  assert.equal(ctx.bodies.filter(b => b && b.switch_from).length, P.MAX_SWITCHES)
+  assert.equal(ctx.bodies.length, 1 + P.MAX_RECONNECTS + P.MAX_SWITCHES)
+  assertReleased()
+})
+
+test('1.0: a network blip reconnects the SAME provider with the recent turns; nothing is announced or re-spoken', async () => {
+  const ctx = chainCtx(GEMINI, GEMINI)
+  const { ws } = await geminiCall(ctx)
+  ws.serve({ serverContent: { inputTranscription: { text: 'what is on my calendar?' } } })
+  ws.serve({ serverContent: { outputTranscription: { text: 'Let me check.' } } })
+  ws.serve({ serverContent: { turnComplete: true } })
+  await settle()
+  ws.drop(1011, 'internal error')
+  await settle()
+  assert.equal(P.call.state, 'connecting')
+  assert.equal(ctx.bodies.length, 1, 'waits SAME_PROVIDER_BACKOFF_MS before asking again')
+  assert.ok(await fireRetry())
+  const body = ctx.bodies.at(-1)
+  assert.equal(body.provider, 'gemini-free')
+  assert.equal(body.reconnect, true)
+  assert.equal(body.reason, 'network')
+  assert.equal(body.switch_from, undefined)
+  assert.equal(body.exclude, undefined)
+  assert.match(body.carry, /User: what is on my calendar\?/)
+  const ws2 = ledger.sockets.at(-1)
+  assert.notEqual(ws2, ws)
+  ws2.open()
+  ws2.serve({ setupComplete: {} })
+  await settle()
+  assert.equal(P.call.state, 'live')
+  assert.equal(P.call.provider.id, 'gemini-free')
+  assert.equal(P.call.retries, 0, 'a live reconnect resets the retries in a row')
+  assert.ok(!ws2.sent.some(m => m.realtimeInput && JSON.stringify(m).includes('switch')), 'no switch note')
+  assert.ok(!sdk.notes.some(n => /switching voice provider/.test(n.message)))
+})
+
+test('1.0: two failed reconnects move the call on along the chain, excluding the failed provider', async () => {
+  const down = Object.assign(new Error('502'), { detail: { reason: 'exhausted', attempts: [{ provider: 'gemini-free', reason: 'unavailable' }] } })
+  const ctx = chainCtx(GEMINI, down, down, PAID)
+  const { ws } = await geminiCall(ctx)
+  ws.drop(1011, 'internal error')
+  await settle()
+  assert.ok(await fireRetry())
+  assert.ok(await fireRetry())
+  assert.equal(await fireRetry(), false, 'no third retry')
+  assert.deepEqual(ctx.bodies.map(b => b && (b.reconnect ? 'reconnect' : b.switch_from ? 'switch' : 'start')),
+    ['start', 'reconnect', 'reconnect', 'switch'])
+  assert.deepEqual(ctx.bodies.at(-1).exclude, ['gemini-free'])
+  assert.equal(ctx.bodies.at(-1).reason, 'unavailable')
+  const ws2 = ledger.sockets.at(-1)
+  ws2.open(); ws2.serve({ setupComplete: {} }); await settle()
+  assert.equal(P.call.provider.id, 'gemini-paid')
+  P.tearDown('')
+})
+
+test('1.0: a quota close never retries the same provider', async () => {
+  const ctx = chainCtx(GEMINI, PAID)
+  const { ws } = await geminiCall(ctx)
+  ws.drop(1011, 'RESOURCE_EXHAUSTED: quota exceeded')
+  await settle(10)
+  assert.equal(P.call.retryTimer, null)
+  assert.equal(ctx.bodies.at(-1).switch_from, 'gemini-free')
+  P.tearDown('')
+})
+
+test('1.0: no provider may take over mid-call (fallback_mid_call): the call ends with a spoken notice and a call-again action', async () => {
+  const off = Object.assign(new Error('503'), { detail: { reason: 'exhausted', message: 'No voice provider could start.',
+    attempts: [{ provider: 'gemini-free', reason: 'excluded' }, { provider: 'openai-codex', reason: 'mid_call_off' }] } })
+  const ctx = chainCtx(GEMINI, off)
+  const { ws } = await geminiCall(ctx)
+  ws.drop(1011, 'RESOURCE_EXHAUSTED: quota exceeded')
+  await settle(10)
+  assertReleased()
+  assert.equal(ledger.peers.length, 0, 'Codex was never started')
+  assert.equal(ledger.spoken.at(-1).text, P.droppedNoticeText('en'))
+  const note = sdk.notes.at(-1)
+  assert.equal(note.kind, 'warning')
+  assert.equal(note.action.label, 'Call again')
+})
+
+test('1.0: a Hermes part the user already heard is not read again after a switch', async () => {
+  const ctx = chainCtx(GEMINI, CODEX)
+  const { ws } = await geminiCall(ctx)
+  ws.serve({ toolCall: { functionCalls: [{ id: 'c1', name: 'hermes_task', args: { request: 'calendar today' } }] } })
+  ws.serve({ serverContent: { turnComplete: true } })
+  await settle()
+  later(5000)
+  reply('You have a dentist appointment at 4.')
+  await settle()
+  const handed = ws.sent.filter(m => m.realtimeInput && JSON.stringify(m).includes('dentist'))
+  assert.equal(handed.length, 1, 'the part was handed to the voice')
+  ws.serve({ serverContent: { modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: 'AAAAAA==' } }] } } })
+  ws.drop(1011, 'RESOURCE_EXHAUSTED: quota exceeded')
+  await settle(10)
+  const pc = ledger.peers.at(-1)
+  pc.dc.open()
+  await settle()
+  pc.dc.serve({ type: 'response.done' })
+  pc.dc.serve({ type: 'response.done' })
+  assert.ok(!userTexts(pc.dc).some(t => t.includes('dentist')), 'heard part not repeated')
+  P.tearDown('')
+})
+
+test('1.0: a Hermes part that was never heard is handed again after a switch', async () => {
+  const ctx = chainCtx(GEMINI, CODEX)
+  const { ws } = await geminiCall(ctx)
+  ws.serve({ toolCall: { functionCalls: [{ id: 'c1', name: 'hermes_task', args: { request: 'calendar today' } }] } })
+  ws.serve({ serverContent: { turnComplete: true } })
+  await settle()
+  later(5000)
+  reply('You have a dentist appointment at 4.')
+  await settle()
+  ws.drop(1011, 'RESOURCE_EXHAUSTED: quota exceeded')
+  await settle(10)
+  const pc = ledger.peers.at(-1)
+  pc.dc.open()
+  await settle()
+  pc.dc.serve({ type: 'response.done' })
+  assert.ok(userTexts(pc.dc).some(t => t.includes('dentist')), 'unheard part handed to the new voice')
+  P.tearDown('')
+})
+
+test('hang-up during a same-provider reconnect backoff opens nothing afterwards', async () => {
+  const ctx = chainCtx(GEMINI, GEMINI)
+  const { ws } = await geminiCall(ctx)
+  ws.drop(1011, 'internal error')
+  await settle()
+  const id = P.call.retryTimer
+  assert.ok(id != null)
+  P.tearDown('')
+  assert.equal(ledger.timers.has(id), false, 'the backoff timer is cleared')
+  assert.equal(ctx.bodies.length, 1)
   assertReleased()
 })
 
@@ -347,7 +489,7 @@ test('hang-up during a provider switch opens nothing afterwards', async () => {
   let release
   const ctx = makeCtx({ mint: body => (body && body.switch_from) ? new Promise(resolve => { release = resolve }) : Promise.resolve(GEMINI) })
   const { ws } = await geminiCall(ctx)
-  ws.drop(1011, 'internal error')
+  ws.drop(1011, 'RESOURCE_EXHAUSTED: quota exceeded')
   await settle()
   assert.equal(P.call.state, 'connecting')
   P.tearDown('')

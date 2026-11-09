@@ -1,4 +1,4 @@
-"""gemini-live-chat — live voice for Hermes Desktop that delegates into the open chat.
+"""Dawn 2.0 Voice (dawn2-voice): live voice for Hermes Desktop that delegates into the open chat.
 
 Nothing is registered on the agent: the voice layer lives in the Desktop renderer
 (``desktop/plugin.js``) and two backend routes (``dashboard/plugin_api.py``) that walk the
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("gemini-live-chat")
+logger = logging.getLogger("dawn2-voice")
 
 
 def register(ctx) -> None:  # noqa: ARG001 - the plugin registers no agent capabilities
@@ -27,5 +27,5 @@ def register(ctx) -> None:  # noqa: ARG001 - the plugin registers no agent capab
     except UnscopedSecretError:
         present = False
     if not present:
-        logger.info("gemini-live-chat: GEMINI_API_KEY is not set for this profile; "
+        logger.info("dawn2-voice: GEMINI_API_KEY is not set for this profile; "
                     "the Desktop button will say so until it is added.")

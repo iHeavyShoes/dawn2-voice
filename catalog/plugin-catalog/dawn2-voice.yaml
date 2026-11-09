@@ -1,12 +1,14 @@
-# DRAFT catalog entry for NousResearch/hermes-agent `plugin-catalog/gemini-live-chat.yaml`.
+# DRAFT catalog entry for NousResearch/hermes-agent `plugin-catalog/dawn2-voice.yaml`.
 # Before opening a PR: set `repo` to the public repository URL and `sha` to the full 40-character
 # commit you want reviewed, then run `hermes plugins validate <checkout> --install-deps` on that
 # commit. Drop these comment lines in the PR copy.
-name: gemini-live-chat
-repo: https://github.com/OWNER/gemini-live-chat
+name: dawn2-voice
+repo: https://github.com/iHeavyShoes/dawn2-voice
 sha: 0000000000000000000000000000000000000000
 description: >-
-  Full-duplex Gemini Live voice for Hermes Desktop that hands every real request to Hermes as a
+  Dawn 2.0 Voice. One brain; the voice is only the messenger: every answer comes from your main
+  Hermes model, and nothing is lost between the call and the chat. Full-duplex live voice for
+  Hermes Desktop that hands every real request to Hermes as a
   normal turn in the chat you have open (prompt.submit, surface voice-live, the recent spoken turns
   as voice_context, the same seam as core GPT-Live), so nothing said on the call is lost. The
   voice only acknowledges while Hermes works, then speaks Hermes' whole answer, part by part,
@@ -29,11 +31,11 @@ description: >-
   name, which is the only part sent. Call transcripts are written to the plugin's Desktop data
   folder and, by default, as one queued turn in the open chat. No shell commands, background
   processes or telemetry.
-maintainer: OWNER
+maintainer: iHeavyShoes
 tier: community
-version: "0.9.1"
+version: "1.0.0"
 category: voice
-docs_url: https://github.com/OWNER/gemini-live-chat#readme
+docs_url: https://github.com/iHeavyShoes/dawn2-voice#readme
 requires_hermes: ">=0.21.5"
 platforms: []
 capabilities:

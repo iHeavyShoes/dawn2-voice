@@ -170,7 +170,7 @@ test('wake: register subscribes to the plugin event and arms the detector', asyn
   ctx.register = () => {}
   P.default.register(ctx)
   await settle()
-  assert.equal(typeof handlers['plugin.gemini-live-chat.wake.detected'], 'function')
+  assert.equal(typeof handlers['plugin.dawn2-voice.wake.detected'], 'function')
   assert.ok(ctx.rests.some(r => r.path === '/wake/arm'))
   assert.equal(P.wake.armed, true)
 })

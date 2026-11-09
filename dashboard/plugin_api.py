@@ -1,4 +1,4 @@
-"""Backend half of gemini-live-chat, mounted at ``/api/plugins/gemini-live-chat/``.
+"""Backend half of dawn2-voice, mounted at ``/api/plugins/dawn2-voice/``.
 
 * ``GET  /status``  -> ``{available, reason, message, settings, problems, providers}``
   (credential *presence* per provider only)
@@ -20,13 +20,13 @@
 * v0.7 wake word (``settings.wake_word``): ``GET /wake`` (state), ``POST /wake/arm`` (listen when the
   setting is on, stop when off), ``/wake/claim {token}`` (the first window to claim a detection
   starts the call), ``/wake/pause`` and ``/wake/resume`` (the call's microphone hand-off). A
-  detection is pushed as the plugin event ``plugin.gemini-live-chat.wake.detected {token, phrase}``.
+  detection is pushed as the plugin event ``plugin.dawn2-voice.wake.detected {token, phrase}``.
 
 Credentials never leave this side and are never returned or logged:
 
 * Gemini keys (``GEMINI_API_KEY``, ``GEMINI_API_KEY_PAID``) are read per request through
   ``agent.secret_scope.get_secret`` (profile-scoped) and spent only in
-  :func:`gemini_live_chat.live.mint_session`.
+  :func:`dawn2_voice.live.mint_session`.
 * The Codex sign-in is never read by the plugin: :func:`_codex_post` asks Hermes core
   (``hermes_cli.plugin_provider_requests.credentialed_provider_request``) to sign one
   ``POST /v1/realtime/client_secrets``; ``plugin.yaml`` declares ``requires_auth: [openai-codex]``.
@@ -49,11 +49,11 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gemini_live_chat import ack, latency, live, openai_rt, prefs, providers, wake  # noqa: E402
+from dawn2_voice import ack, latency, live, openai_rt, prefs, providers, wake  # noqa: E402
 
-logger = logging.getLogger("gemini-live-chat")
+logger = logging.getLogger("dawn2-voice")
 router = APIRouter()
-PLUGIN_ID = "gemini-live-chat"
+PLUGIN_ID = "dawn2-voice"
 NO_KEY_MESSAGE = ("Gemini Live needs GEMINI_API_KEY. Add it to this Hermes profile's .env "
                   "(Google AI Studio key), then reload the plugin.")
 
@@ -138,7 +138,7 @@ SOUL_READ_LIMIT = 16_384
 def _soul_text() -> Optional[str]:
     """The head of the serving profile's ``SOUL.md`` (``hermes_constants.get_hermes_home()``, the
     home this request is scoped to), or None. Only the agent's name and stated gender are extracted
-    from it (:func:`gemini_live_chat.persona.identity_from_soul`); the text itself is not sent."""
+    from it (:func:`dawn2_voice.persona.identity_from_soul`); the text itself is not sent."""
     try:
         from hermes_constants import get_hermes_home
         path = Path(get_hermes_home()) / "SOUL.md"
@@ -151,14 +151,14 @@ def _soul_text() -> Optional[str]:
 
 
 def _settings() -> Dict[str, Any]:
-    """This profile's ``plugins.entries.gemini-live-chat.settings`` (``load_config`` is scoped to the
+    """This profile's ``plugins.entries.dawn2-voice.settings`` (``load_config`` is scoped to the
     profile the request is for), with the persona resolved against that profile's SOUL.md."""
     try:
         from hermes_cli.config import load_config_readonly
         entry = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
         cfg = live.settings(entry.get("settings"))
     except Exception:
-        logger.warning("gemini-live-chat: settings unreadable, using defaults")
+        logger.warning("dawn2-voice: settings unreadable, using defaults")
         cfg = live.settings(None)
     return live.resolve_persona(cfg, _soul_text())
 
@@ -212,7 +212,7 @@ def set_choice(body: Optional[Dict[str, Any]] = None):
     if not p.set_choice(choice):
         return JSONResponse(status_code=500, content={"detail": {
             "reason": "not_saved", "message": "The provider choice could not be saved."}})
-    logger.info("gemini-live-chat: voice provider choice set to %s", choice)
+    logger.info("dawn2-voice: voice provider choice set to %s", choice)
     return _picker(_settings(), _sources(), p)
 
 
@@ -223,7 +223,7 @@ def report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     body = body if isinstance(body, dict) else {}
     ok = _prefs().report(body.get("provider"), body.get("reason"))
     if ok:
-        logger.info("gemini-live-chat: voice provider %s reported %s", body.get("provider"), body.get("reason"))
+        logger.info("dawn2-voice: voice provider %s reported %s", body.get("provider"), body.get("reason"))
     return {"recorded": ok}
 
 
@@ -234,7 +234,7 @@ def latency_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     rec = latency.clean(body)
     if rec is None:
         return {"ok": False}
-    logger.info("gemini-live-chat: %s", latency.line(rec))
+    logger.info("dawn2-voice: %s", latency.line(rec))
     return {"ok": True}
 
 
@@ -255,11 +255,11 @@ def flow_ack_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     rec = ack.clean_stats(body)
     if rec is None:
         return {"ok": False}
-    logger.info("gemini-live-chat: ack_source=%s ack_latency=%dms", rec["ack_source"], rec["ack_latency"])
+    logger.info("dawn2-voice: ack_source=%s ack_latency=%dms", rec["ack_source"], rec["ack_latency"])
     return {"ok": True}
 
 
-# ── v0.7: the plugin's own wake word (gemini_live_chat/wake.py) ─────────────────────────────────
+# ── v0.7: the plugin's own wake word (dawn2_voice/wake.py) ─────────────────────────────────
 
 
 def _wake_status(m: "wake.WakeManager", cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -298,7 +298,7 @@ def _auto_arm(reason: str) -> None:
         m.auto_arm(live.effective_wake_phrase(cfg), cfg.get("wake_sensitivity", live.DEFAULT_WAKE_SENSITIVITY),
                    core_wake_on=_core_wake_on(), reason=reason)
     except Exception:
-        logger.warning("gemini-live-chat: wake word auto-arm failed", exc_info=True)
+        logger.warning("dawn2-voice: wake word auto-arm failed", exc_info=True)
 
 
 @router.get("/wake")
@@ -336,7 +336,7 @@ def _arm_on_mount() -> None:
     background so a slow first engine build never delays the server start. Outside Hermes (tests,
     ``hermes plugins validate``) nothing runs."""
     if _in_hermes():
-        wake._spawn(lambda: _auto_arm("startup"), "glc-wake-auto-arm")
+        wake._spawn(lambda: _auto_arm("startup"), "d2v-wake-auto-arm")
 
 
 _arm_on_mount()
@@ -371,18 +371,20 @@ def session(body: Optional[Dict[str, Any]] = None):
     only = body.get("provider") if body.get("provider") in providers.PROVIDERS else None
     switch_from = body.get("switch_from") if body.get("switch_from") in providers.PROVIDERS else None
     reason = providers.clean_reason(body.get("reason"))
-    kind = "resume" if only else ("mid_call" if switch_from else "connect")
+    reconnect = bool(only) and body.get("reconnect") is True
+    kind = "reconnect" if reconnect else ("resume" if only else ("mid_call" if switch_from else "connect"))
     minted, attempts = providers.connect(
         providers.order_for(choice, cfg["providers"]), cfg, _sources(),
         # The user picked this one provider: a cooldown (advice) never skips it.
         exclude=() if pinned else providers.clean_ids(body.get("exclude")),
         only=only,
-        resume_handle=live.valid_handle(body.get("resume_handle")) if only else None,
+        resume_handle=live.valid_handle(body.get("resume_handle")) if only and not reconnect else None,
         carry=body.get("carry") or "",
+        mid_call=bool(switch_from),
     )
     p.record(attempts, served=minted["provider"] if minted else None)
     if minted is None:
-        logger.info("gemini-live-chat: no voice provider could serve (%s; choice=%s; %s)", kind, choice,
+        logger.info("dawn2-voice: no voice provider could serve (%s; choice=%s; %s)", kind, choice,
                     ",".join(f"{a['provider']}:{a['reason']}" for a in attempts) or "none configured")
         unconfigured = all(a["reason"] in providers.UNCONFIGURED for a in attempts)
         if pinned and not only:
@@ -395,10 +397,10 @@ def session(body: Optional[Dict[str, Any]] = None):
             message = providers.failure_message(attempts)
             # no_key: nothing is set up (v0.3 contract); exhausted: something was tried and refused.
             reason_out = "no_key" if unconfigured else "exhausted"
-        status_code = 503 if unconfigured or all(a["reason"] in providers.UNCONFIGURED + ("excluded",)
+        status_code = 503 if unconfigured or all(a["reason"] in providers.UNCONFIGURED + ("excluded", "mid_call_off")
                                                  for a in attempts) else 502
         return JSONResponse(status_code=status_code, content={"detail": {
             "reason": reason_out, "message": message, "attempts": attempts, "choice": choice}})
-    logger.info("gemini-live-chat: %s", providers.log_line(minted, kind, switch_from, reason))
+    logger.info("dawn2-voice: %s", providers.log_line(minted, kind, switch_from, reason))
     minted["choice"] = choice
     return minted

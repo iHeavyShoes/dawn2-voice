@@ -34,7 +34,7 @@ _LANGUAGE = {
            "switch to English. Always answer in the language the user spoke last."),
     "en": ("Start the conversation in English. If the user speaks Hebrew (or asks you to switch), "
            "switch to Hebrew. Always answer in the language the user spoke last."),
-    "auto": "Answer in the language the user spoke last. Hebrew and English are both expected.",
+    "auto": "Answer in the language the user spoke last.",
 }
 
 _GENDER = {
@@ -68,7 +68,7 @@ HONESTY = (
     "hand the question to hermes_task, or say plainly that you do not know.\n"
     "- Facts about this call you may state: your voice is {voice_kind} (male and female "
     "voices exist) currently set to {voice}; voice, gender, name and starting language are plugin "
-    "settings of gemini-live-chat (keys {voice_key}, persona_gender, persona_name, language) and a change "
+    "settings of dawn2-voice (keys {voice_key}, persona_gender, persona_name, language) and a change "
     "applies from the next call. You cannot change them during the call yourself; offer to hand the "
     "change to hermes_task instead."
 )
@@ -202,7 +202,7 @@ def identity_from_soul(text: Optional[str]) -> Tuple[Optional[str], Optional[str
 def instructions(language: str, extra: str = "", name: str = DEFAULT_PERSONA_NAME,
                  gender: str = "male", voice: str = "", name_he: str = "", engine: str = "gemini",
                  carry: str = "") -> str:
-    lang = _LANGUAGE.get((language or "he").split("-")[0], None)
+    lang = _LANGUAGE.get((language or "auto").split("-")[0], None)
     if lang is None:
         lang = (f"Start the conversation in the language with code '{language}'. Switch when the "
                 "user switches; always answer in the language the user spoke last.")
@@ -245,6 +245,8 @@ RELAY = (
     "the tag aloud, word for word, in the language it is written in, at a natural, unhurried pace. "
     "Do not add, drop, translate, summarise, answer or comment on anything, and never read the tag.\n"
     "- Say numbers, names, dates and abbreviations the natural way for that language.\n"
+    "- Read every Latin-script word, name, handle or code inside Hebrew text exactly as written, "
+    "in its place; never skip one.\n"
     "- Never speak about anything else, even if the user asks you directly."
 )
 

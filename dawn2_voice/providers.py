@@ -51,15 +51,19 @@ PROVIDERS: Dict[str, Provider] = {
     GEMINI_PAID: Provider(GEMINI_PAID, "Gemini (paid key)", "gemini-live", "GEMINI_API_KEY_PAID"),
 }
 DEFAULT_ORDER: Tuple[str, ...] = (GEMINI_FREE, OPENAI_CODEX, GEMINI_PAID)
+#: 1.0: providers that may take over a call that is already running (setting ``fallback_mid_call``).
+#: The Codex route is left out by default: it draws on the ChatGPT plan's realtime quota, fast.
+DEFAULT_MID_CALL: Tuple[str, ...] = (GEMINI_FREE, GEMINI_PAID)
 
 #: Why a provider did not serve. The renderer uses the same words for mid-call failures.
 REASONS = ("no_key", "not_signed_in", "unsupported", "quota", "billing", "auth", "unavailable",
-           "unreachable", "rejected", "excluded", "network", "expired")
+           "unreachable", "rejected", "excluded", "network", "expired", "mid_call_off")
 _REASON_TEXT = {
     "no_key": "no key", "not_signed_in": "not signed in", "unsupported": "this Hermes is too old",
     "quota": "quota or rate limit", "billing": "no credit / billing", "auth": "credential refused",
     "unavailable": "service unavailable", "unreachable": "unreachable", "rejected": "request refused",
     "excluded": "skipped on this call", "network": "connection lost", "expired": "session expired",
+    "mid_call_off": "does not take over a running call (fallback_mid_call)",
 }
 #: Reasons that mean "not set up" rather than "tried and refused".
 UNCONFIGURED = ("no_key", "not_signed_in", "unsupported")
@@ -127,6 +131,24 @@ def parse_order(raw: Any, problems: List[str]) -> List[str]:
     if not order:
         problems.append(f"settings.providers has no known provider; using {', '.join(DEFAULT_ORDER)}")
         return list(DEFAULT_ORDER)
+    return order
+
+
+def parse_mid_call(raw: Any, problems: List[str]) -> List[str]:
+    """``fallback_mid_call`` setting: the providers that may take over a running call. Empty: the
+    default (every provider but ``openai-codex``); ``none``: no automatic switch mid-call at all."""
+    if raw in (None, "", []):
+        return list(DEFAULT_MID_CALL)
+    if isinstance(raw, str) and raw.strip().lower() == "none":
+        return []
+    if isinstance(raw, str) and raw.strip().lower() == "all":
+        return list(PROVIDERS)
+    sub: List[str] = []
+    order = parse_order(raw, sub)
+    if sub:
+        problems.extend(m.replace("settings.providers", "settings.fallback_mid_call") for m in sub)
+        if any("no known provider" in m or "is not valid" in m for m in sub):
+            return list(DEFAULT_MID_CALL)
     return order
 
 
@@ -233,21 +255,27 @@ def _mint_one(provider_id: str, cfg: Dict[str, Any], src: Sources, resume_handle
 
 def connect(order: Sequence[str], cfg: Dict[str, Any], src: Sources, *, exclude: Sequence[str] = (),
             only: Optional[str] = None, resume_handle: Optional[str] = None,
-            carry: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, str]]]:
+            carry: str = "", mid_call: bool = False) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, str]]]:
     """Mint a session on the first provider of *order* that can serve.
 
-    ``only`` pins one provider (Gemini resumption: a handle belongs to the key that issued it) and
-    disables fallback. Returns ``(minted or None, attempts)``; ``attempts`` lists every provider
-    that was skipped or refused, in order, as ``{"provider", "reason"}``.
+    ``only`` pins one provider (Gemini resumption, or a same-provider reconnect) and disables
+    fallback. ``mid_call``: the call is already running (a switch after a failure); providers not in
+    ``cfg["fallback_mid_call"]`` are skipped (``mid_call_off``). Returns ``(minted or None,
+    attempts)``; ``attempts`` lists every provider that was skipped or refused, in order, as
+    ``{"provider", "reason"}``.
     """
     attempts: List[Dict[str, str]] = []
     candidates = [only] if only else list(order)
     carry = persona.clean_carry(carry)
+    takeover = cfg.get("fallback_mid_call", DEFAULT_MID_CALL)
     for pid in candidates:
         if pid not in PROVIDERS:
             continue
         if pid in exclude and not only:
             attempts.append({"provider": pid, "reason": "excluded"})
+            continue
+        if mid_call and not only and pid not in takeover:
+            attempts.append({"provider": pid, "reason": "mid_call_off"})
             continue
         ok, reason = readiness(pid, src)
         if not ok:
@@ -295,6 +323,8 @@ def log_line(minted: Dict[str, Any], kind: str, switch_from: Optional[str], reas
     line = f"voice provider {minted['provider']} serving ({kind}; model={model}"
     if switch_from:
         line += f"; switched from {switch_from}" + (f" after {reason}" if reason else "")
+    elif kind == "reconnect" and reason:
+        line += f"; after {reason}"
     if skipped:
         line += f"; skipped {skipped}"
     return line + ")"

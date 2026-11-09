@@ -41,7 +41,7 @@ AUTO = "auto"
 DEFAULT_VOICE = AUTO  # follows the persona's gender: MALE_VOICE or FEMALE_VOICE
 MALE_VOICE = "Charon"
 FEMALE_VOICE = "Aoede"
-DEFAULT_LANGUAGE = "he"
+DEFAULT_LANGUAGE = "auto"  # follow the user; a starting language (he, en, ...) is a setting
 PERSONA_GENDERS = (AUTO,) + persona.GENDERS
 #: When neither the setting, the profile's SOUL.md nor an explicit voice says otherwise.
 FALLBACK_GENDER = "male"
@@ -110,7 +110,7 @@ def _int_in(raw: Any, default: int, bounds: Tuple[int, int]) -> int:
 
 
 def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """``plugins.entries.gemini-live-chat.settings`` with defaults. Invalid values fall back to the
+    """``plugins.entries.dawn2-voice.settings`` with defaults. Invalid values fall back to the
     default and are listed in ``problems`` so the status route can show them."""
     raw = raw if isinstance(raw, dict) else {}
     problems = []
@@ -144,10 +144,12 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "brain": pick("brain", lambda v: v in BRAINS, DEFAULT_BRAIN),
         # v0.4: the provider chain (order of providers.PROVIDERS ids) and the OpenAI Realtime engine.
         "providers": _providers(raw.get("providers"), problems),
+        # 1.0: which providers may take over a call that is already running.
+        "fallback_mid_call": _mid_call(raw.get("fallback_mid_call"), problems),
         "openai_model": str(pick("openai_model", _valid_openai_model, _OPENAI_DEFAULT_MODEL)).strip(),
         "openai_voice": pick("openai_voice", lambda v: v == AUTO or v in _OPENAI_VOICES, AUTO),
         "openai_speed": _float_in(None if isinstance(raw.get("openai_speed"), bool) else raw.get("openai_speed"), 1.15, (.25, 1.5)),
-        # v0.7: the plugin's own wake word (off by default; see gemini_live_chat/wake.py).
+        # v0.7: the plugin's own wake word (off by default; see dawn2_voice/wake.py).
         "wake_word": raw.get("wake_word") is True or str(raw.get("wake_word")).strip().lower() in ("true", "on", "yes", "1"),
         "wake_phrase": _wake_phrase(raw.get("wake_phrase"), problems),
         "wake_sensitivity": _float_in(raw.get("wake_sensitivity"), DEFAULT_WAKE_SENSITIVITY, (0.0, 1.0)),
@@ -200,6 +202,11 @@ def _valid_openai_model(value: Any) -> bool:
 def _providers(raw: Any, problems: list) -> list:
     from . import providers
     return providers.parse_order(raw, problems)
+
+
+def _mid_call(raw: Any, problems: list) -> list:
+    from . import providers
+    return providers.parse_mid_call(raw, problems)
 
 
 def _as_list(raw: Any) -> Optional[list]:

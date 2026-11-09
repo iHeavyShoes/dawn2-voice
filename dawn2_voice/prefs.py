@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from . import providers
 
-logger = logging.getLogger("gemini-live-chat")
+logger = logging.getLogger("dawn2-voice")
 
 CHOICE_KEY = "provider_choice"
 HEALTH_KEY = "provider_health"
@@ -58,7 +58,7 @@ class Prefs:
         try:
             return self.store.get(key, default)
         except Exception:  # unreadable state file: behave as a fresh install
-            logger.warning("gemini-live-chat: plugin state unreadable (%s); using defaults", key)
+            logger.warning("dawn2-voice: plugin state unreadable (%s); using defaults", key)
             return default
 
     def _set(self, key: str, value: Any) -> bool:
@@ -66,7 +66,7 @@ class Prefs:
             self.store.set(key, value)
             return True
         except Exception:
-            logger.warning("gemini-live-chat: plugin state not writable (%s)", key)
+            logger.warning("dawn2-voice: plugin state not writable (%s)", key)
             return False
 
     # ── choice ──────────────────────────────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""v0.7: the plugin's own wake word (gemini_live_chat/wake.py) and its /wake/* routes.
+"""v0.7: the plugin's own wake word (dawn2_voice/wake.py) and its /wake/* routes.
 
 The engine (Hermes core's ``tools.wake_word``) is replaced by a fake with the same four calls, so the
 state machine, the microphone hand-off, the claim and the re-arm retries are tested without audio.
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gemini_live_chat import live, wake  # noqa: E402
+from dawn2_voice import live, wake  # noqa: E402
 
 
 class WakeWordInUse(RuntimeError):
@@ -104,7 +104,7 @@ def rig():
 
 def armed(rig, phrase="hey ray"):
     rig.m.arm(phrase, 0.5)
-    rig.run("glc-wake-arm")
+    rig.run("d2v-wake-arm")
     assert rig.m.status()["state"] == "listening"
 
 
@@ -226,9 +226,9 @@ def test_expired_claim_is_refused(rig):
 def test_unclaimed_detection_re_arms_after_the_timeout(rig):
     armed(rig)
     rig.engine.say_phrase()
-    rig.run("glc-wake-claim")
+    rig.run("d2v-wake-claim")
     assert wake.CLAIM_TIMEOUT_S in rig.sleeps
-    rig.run("glc-wake-resume")
+    rig.run("d2v-wake-resume")
     assert rig.m.status()["state"] == "listening"
     assert rig.engine.paused is False
 
@@ -237,8 +237,8 @@ def test_claimed_detection_is_not_re_armed_by_the_watchdog(rig):
     armed(rig)
     rig.engine.say_phrase()
     assert rig.m.claim(rig.events[0][1]["token"])
-    rig.run("glc-wake-claim")
-    assert not any(n.startswith("glc-wake-resume") for n, _ in rig.pending)
+    rig.run("d2v-wake-claim")
+    assert not any(n.startswith("d2v-wake-resume") for n, _ in rig.pending)
     assert rig.m.status()["state"] == "paused", "the call holds the mic until it hangs up"
 
 
@@ -297,7 +297,7 @@ def test_manager_is_one_per_process():
 
 @pytest.fixture
 def api(monkeypatch, rig):
-    spec = importlib.util.spec_from_file_location("glc_plugin_api_wake", ROOT / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("d2v_plugin_api_wake", ROOT / "dashboard" / "plugin_api.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     from fastapi import FastAPI
@@ -336,6 +336,6 @@ def test_route_claim_pause_resume(api):
     assert api.post("/p/wake/claim", json={"token": "nope"}).json() == {"claimed": False}
     assert api.post("/p/wake/claim", json={"token": token}).json() == {"claimed": True}
     assert api.post("/p/wake/resume").json() == {"resuming": True}
-    api.rig.run("glc-wake-resume")
+    api.rig.run("d2v-wake-resume")
     assert api.post("/p/wake/pause").json() == {"paused": True}
     assert api.post("/p/wake/claim").json() == {"claimed": False}

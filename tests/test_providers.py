@@ -8,7 +8,7 @@ import logging
 
 import pytest
 
-from gemini_live_chat import live, openai_rt, persona, providers
+from dawn2_voice import live, openai_rt, persona, providers
 
 FREE_KEY = "AIzaFREE-not-a-real-key-000000000000000"
 PAID_KEY = "AIzaPAID-not-a-real-key-111111111111111"
@@ -230,7 +230,7 @@ CODEX_LAST = {}
 @pytest.mark.parametrize("pid", list(providers.PROVIDERS))
 def test_delegation_contract_is_identical_on_every_provider(pid):
     codex = Codex()
-    minted, _ = providers.connect([pid], cfg(persona_name="Ray"), src(codex=codex))
+    minted, _ = providers.connect([pid], cfg(persona_name="Ray", language="he"), src(codex=codex))
     CODEX_LAST.clear()
     if codex.calls:
         CODEX_LAST.update(codex.calls[0])

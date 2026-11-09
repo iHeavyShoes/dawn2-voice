@@ -21,7 +21,7 @@ EK = "ek_route_test_secret_42"
 
 
 def _load_api():
-    spec = importlib.util.spec_from_file_location("glc_plugin_api_chain", ROOT / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("d2v_plugin_api_chain", ROOT / "dashboard" / "plugin_api.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -79,12 +79,12 @@ def env(monkeypatch):
     real = api.live.mint_session
     monkeypatch.setattr(api.live, "mint_session", lambda key, cfg, **kw: real(key, cfg, **{**kw, "poster": poster}))
     app = FastAPI()
-    app.include_router(api.router, prefix="/api/plugins/gemini-live-chat")
+    app.include_router(api.router, prefix="/api/plugins/dawn2-voice")
     state["client"] = TestClient(app)
     return state
 
 
-URL = "/api/plugins/gemini-live-chat"
+URL = "/api/plugins/dawn2-voice"
 
 
 def test_status_lists_the_chain_with_presence_only(env):
@@ -117,17 +117,64 @@ def test_free_quota_falls_back_to_codex_signed_by_core(env, caplog):
     assert EK not in caplog.text and FREE not in caplog.text
 
 
-def test_mid_call_switch_excludes_the_failed_provider_and_carries_context(env, caplog):
+def _settings(monkeypatch, **settings):
+    cli = sys.modules["hermes_cli"]
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {"plugins": {"entries": {"dawn2-voice": {"settings": settings}}}}
+    cli.config = config
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+
+
+def test_mid_call_switch_skips_codex_by_default_and_never_asks_the_failed_provider(env, caplog):
     caplog.set_level(logging.INFO)
     r = env["client"].post(f"{URL}/session", json={
         "exclude": ["gemini-free"], "switch_from": "gemini-free", "reason": "network",
         "carry": "User: book a table\nVoice: I'm checking."})
     out = r.json()
+    # 1.0: fallback_mid_call defaults to the Gemini keys only; Codex is never started mid-call
+    assert out["provider"] == "gemini-paid"
+    assert {"provider": "openai-codex", "reason": "mid_call_off"} in out["attempts"]
+    assert env["signed"] == []
+    assert env["google"] == [PAID]  # the failed provider is not asked again
+    assert "switched from gemini-free after network" in caplog.text
+
+
+def test_mid_call_switch_to_codex_when_fallback_mid_call_allows_it(env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    _settings(monkeypatch, fallback_mid_call="all")
+    out = env["client"].post(f"{URL}/session", json={
+        "exclude": ["gemini-free"], "switch_from": "gemini-free", "reason": "network",
+        "carry": "User: book a table\nVoice: I'm checking."}).json()
     assert out["provider"] == "openai-codex"
     # brain: hermes needs no carry-over (the renderer keeps the conversation; the voice only reads)
     assert "User: book a table" not in env["signed"][0]["json"]["session"]["instructions"]
-    assert env["google"] == []  # the failed provider is not asked again
-    assert "switched from gemini-free after network" in caplog.text
+    assert env["google"] == []
+
+
+def test_mid_call_with_no_allowed_provider_is_a_503_naming_the_setting(env, monkeypatch):
+    _settings(monkeypatch, providers="gemini-free,openai-codex")
+    r = env["client"].post(f"{URL}/session", json={
+        "exclude": ["gemini-free"], "switch_from": "gemini-free", "reason": "quota"})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["attempts"] == [{"provider": "gemini-free", "reason": "excluded"},
+                                  {"provider": "openai-codex", "reason": "mid_call_off"}]
+    assert env["signed"] == []
+
+
+def test_a_new_call_may_still_start_on_codex(env):
+    env["google_status"][FREE] = (429, {"error": "quota"})
+    out = env["client"].post(f"{URL}/session", json={}).json()
+    assert out["provider"] == "openai-codex"  # fallback_mid_call only limits running calls
+
+
+def test_same_provider_reconnect_is_pinned_and_ignores_resume_handles(env, caplog):
+    caplog.set_level(logging.INFO)
+    out = env["client"].post(f"{URL}/session", json={
+        "provider": "openai-codex", "reconnect": True, "reason": "network", "resume_handle": "h-1"}).json()
+    assert out["provider"] == "openai-codex"
+    assert env["google"] == []
+    assert "serving (reconnect;" in caplog.text and "after network" in caplog.text
 
 
 def test_not_signed_in_skips_codex_to_paid_gemini(env):
@@ -155,7 +202,7 @@ def test_everything_refused_is_one_clear_error_with_every_reason(env):
 def test_custom_order_and_resume_pinning(env, monkeypatch):
     cli = sys.modules["hermes_cli"]
     config = types.ModuleType("hermes_cli.config")
-    config.load_config_readonly = lambda: {"plugins": {"entries": {"gemini-live-chat": {
+    config.load_config_readonly = lambda: {"plugins": {"entries": {"dawn2-voice": {
         "settings": {"providers": "gemini-paid,gemini-free"}}}}}
     cli.config = config
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config)

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gemini_live_chat import live, wake  # noqa: E402
+from dawn2_voice import live, wake  # noqa: E402
 from tests.test_wake import FakeEngine, rig as _rig  # noqa: E402,F401
 
 rig = _rig
@@ -30,7 +30,7 @@ rig = _rig
 def test_auto_arm_starts_the_detector_without_a_window(rig):
     s = rig.m.auto_arm("hey ray", 0.5)
     assert s["state"] == "arming"
-    rig.run("glc-wake-arm")
+    rig.run("d2v-wake-arm")
     assert rig.m.status()["state"] == "listening"
     assert rig.engine.owner is rig.m.owner and rig.engine.config["phrase"] == "hey ray"
 
@@ -90,7 +90,7 @@ def _import_api(monkeypatch, *, in_hermes: bool, settings: dict, core_on: bool, 
         cfg = types.ModuleType("hermes_cli.config")
         cfg.load_config_readonly = lambda: {
             "wake_word": {"enabled": core_on},
-            "plugins": {"entries": {"gemini-live-chat": {"settings": settings}}},
+            "plugins": {"entries": {"dawn2-voice": {"settings": settings}}},
         }
         cli.config = cfg
         monkeypatch.setitem(sys.modules, "hermes_cli", cli)
@@ -98,7 +98,7 @@ def _import_api(monkeypatch, *, in_hermes: bool, settings: dict, core_on: bool, 
     monkeypatch.setattr(wake, "manager", lambda: manager)
     spawned = []
     monkeypatch.setattr(wake, "_spawn", lambda fn, name: spawned.append(name) or fn())
-    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_gemini_live_chat_t", ROOT / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_dawn2_voice_t", ROOT / "dashboard" / "plugin_api.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod, spawned
@@ -113,7 +113,7 @@ def test_route_mount_arms_when_the_setting_is_on(monkeypatch):
     engine = FakeEngine()
     m = _manager(engine)
     _, spawned = _import_api(monkeypatch, in_hermes=True, settings={"wake_word": True}, core_on=False, manager=m)
-    assert "glc-wake-auto-arm" in spawned
+    assert "d2v-wake-auto-arm" in spawned
     assert m.status()["state"] == "listening" and engine.config["phrase"] == "hey hermes"
 
 

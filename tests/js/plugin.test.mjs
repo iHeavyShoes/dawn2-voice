@@ -278,6 +278,12 @@ test('remote close tears the call down when no other provider can take over', as
   const { ws } = await liveCall(ctx)
   ws.drop(1011, 'internal')
   await settle()
+  // 1.0: a network-class close first reconnects the same provider (SAME_PROVIDER_BACKOFF_MS)
+  for (let i = 0; i < P.SAME_PROVIDER_BACKOFF_MS.length && P.call.retryTimer; i++) {
+    const id = P.call.retryTimer
+    const fn = ledger.timers.get(id); ledger.timers.delete(id); fn()
+    await settle(10)
+  }
   assertAllReleased()
   assert.match(P.call.detail, /1011/)
   assert.match(P.call.detail, /No voice provider could start/)

@@ -13,7 +13,7 @@ Flow (one detector per gateway process, owned by this module):
 1. ``arm(cfg)``: the renderer asks once per window; the engine is built on a worker thread (the
    first arm may install ``wake-sherpa`` and download the ~13 MB model).
 2. Detection (detector thread): the microphone is released FIRST (``pause_listening``), then
-   ``plugin.gemini-live-chat.wake.detected {token, phrase}`` goes to every connected window.
+   ``plugin.dawn2-voice.wake.detected {token, phrase}`` goes to every connected window.
 3. ``claim(token)``: the first eligible window (the Desktop app) to claim the token starts the call;
    every other window gets ``False``. Unclaimed after ``CLAIM_TIMEOUT_S``: the detector re-arms.
 4. ``pause()`` before a call started from the button; ``resume()`` after every hang-up, retrying
@@ -32,7 +32,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-logger = logging.getLogger("gemini-live-chat")
+logger = logging.getLogger("dawn2-voice")
 
 EVENT = "wake.detected"
 CLAIM_TIMEOUT_S = 15.0
@@ -77,7 +77,7 @@ def _load_engine_module():
 
 def _broadcast(event: str, payload: Dict[str, Any]) -> None:
     from hermes_cli.plugin_events import broadcast_plugin_event
-    broadcast_plugin_event("gemini-live-chat", event, payload)
+    broadcast_plugin_event("dawn2-voice", event, payload)
 
 
 def _spawn(fn: Callable[[], None], name: str) -> None:
@@ -124,9 +124,9 @@ class WakeManager:
             return self.status()
         if core_wake_on:
             self.refuse(CORE_WAKE_ON_MESSAGE)
-            logger.warning("gemini-live-chat: wake word not armed (%s): %s", reason, CORE_WAKE_ON_MESSAGE)
+            logger.warning("dawn2-voice: wake word not armed (%s): %s", reason, CORE_WAKE_ON_MESSAGE)
             return self.status()
-        logger.info("gemini-live-chat: arming the wake word on %s", reason)
+        logger.info("dawn2-voice: arming the wake word on %s", reason)
         return self.arm(phrase, sensitivity)
 
     def refuse(self, msg: str) -> Dict[str, Any]:
@@ -158,7 +158,7 @@ class WakeManager:
             self._gen += 1
             gen = self._gen
             self._key, self.phrase, self.state, self.error = key, phrase, "arming", ""
-        self._spawn(lambda: self._arm_worker(gen, key), "glc-wake-arm")
+        self._spawn(lambda: self._arm_worker(gen, key), "d2v-wake-arm")
         return self.status()
 
     def _arm_worker(self, gen: int, key: tuple) -> None:
@@ -177,7 +177,7 @@ class WakeManager:
                        "wake word. Turn that off (wake_word.enabled: false) so this plugin can listen.")
             else:
                 msg = f"The wake word could not start: {str(e)[:200] or type(e).__name__}"
-            logger.warning("gemini-live-chat: wake word not armed: %s", msg)
+            logger.warning("dawn2-voice: wake word not armed: %s", msg)
             self._fail(gen, "error", msg)
             return
         with self._lock:
@@ -189,7 +189,7 @@ class WakeManager:
         if stale:
             self._stop_engine(ww)
             return
-        logger.info("gemini-live-chat: wake word listening for %r", phrase)
+        logger.info("dawn2-voice: wake word listening for %r", phrase)
 
     def _fail(self, gen: int, state: str, msg: str) -> None:
         with self._lock:
@@ -200,7 +200,7 @@ class WakeManager:
         try:
             ww.stop_listening(owner=self.owner)
         except Exception:
-            logger.debug("gemini-live-chat: wake stop failed", exc_info=True)
+            logger.debug("dawn2-voice: wake stop failed", exc_info=True)
 
     def disarm(self) -> Dict[str, Any]:
         with self._lock:
@@ -223,7 +223,7 @@ class WakeManager:
             if not ww.pause_listening(owner=self.owner):
                 return
         except Exception:
-            logger.debug("gemini-live-chat: wake pause failed", exc_info=True)
+            logger.debug("dawn2-voice: wake pause failed", exc_info=True)
             return
         token = secrets.token_hex(8)
         with self._lock:
@@ -232,12 +232,12 @@ class WakeManager:
             self.detections += 1
             gen = self._gen
             phrase = self.phrase
-        logger.info("gemini-live-chat: wake word heard; offering the call to the open windows")
+        logger.info("dawn2-voice: wake word heard; offering the call to the open windows")
         try:
             self._broadcast(EVENT, {"token": token, "phrase": phrase})
         except Exception:
-            logger.warning("gemini-live-chat: wake event not delivered", exc_info=True)
-        self._spawn(lambda: self._claim_watchdog(gen, token), "glc-wake-claim")
+            logger.warning("dawn2-voice: wake event not delivered", exc_info=True)
+        self._spawn(lambda: self._claim_watchdog(gen, token), "d2v-wake-claim")
 
     def _claim_watchdog(self, gen: int, token: str) -> None:
         self._sleep(CLAIM_TIMEOUT_S)
@@ -246,7 +246,7 @@ class WakeManager:
             if unclaimed:
                 self._token = None
         if unclaimed:  # no window took the call (none open, or none eligible): listen again
-            logger.info("gemini-live-chat: wake not claimed by any window; listening again")
+            logger.info("dawn2-voice: wake not claimed by any window; listening again")
             self.resume()
 
     def claim(self, token: Any) -> bool:
@@ -283,7 +283,7 @@ class WakeManager:
             if self.state != "paused":
                 return False
             gen = self._gen
-        self._spawn(lambda: self._resume_worker(gen), "glc-wake-resume")
+        self._spawn(lambda: self._resume_worker(gen), "d2v-wake-resume")
         return True
 
     def _resume_worker(self, gen: int) -> None:
@@ -307,7 +307,7 @@ class WakeManager:
             if gen == self._gen and self.state == "paused":
                 self.state = "error"
                 self.error = f"The wake word could not re-open the microphone: {last}. Reload the plugin to retry."
-        logger.warning("gemini-live-chat: wake word not resumed after the call: %s", last)
+        logger.warning("dawn2-voice: wake word not resumed after the call: %s", last)
 
     def _status_locked(self) -> Dict[str, Any]:
         return {"state": self.state, "phrase": self.phrase, "error": self.error, "detections": self.detections}

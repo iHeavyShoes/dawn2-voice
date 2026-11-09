@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT))
 
 
 def test_isolated_ack_request_has_no_tools_and_only_two_bounded_context_fields():
-    from gemini_live_chat import ack
+    from dawn2_voice import ack
     calls = []
     def post(url, headers, body, timeout):
         calls.append((url, body, timeout))
@@ -26,7 +26,7 @@ def test_isolated_ack_request_has_no_tools_and_only_two_bounded_context_fields()
 
 
 def test_ack_failures_do_not_return_vendor_content_or_keys():
-    from gemini_live_chat import ack
+    from dawn2_voice import ack
     assert ack.generate('', 'a', 'b') == {"text": ""}
     def post(*args):
         raise RuntimeError('private vendor content')
@@ -34,8 +34,8 @@ def test_ack_failures_do_not_return_vendor_content_or_keys():
 
 
 def test_ack_route_uses_only_requested_gemini_provider_and_rejects_unbounded_input(monkeypatch):
-    from gemini_live_chat import ack
-    spec = importlib.util.spec_from_file_location('glc_ack_routes', ROOT / 'dashboard/plugin_api.py')
+    from dawn2_voice import ack
+    spec = importlib.util.spec_from_file_location('d2v_ack_routes', ROOT / 'dashboard/plugin_api.py')
     api = importlib.util.module_from_spec(spec); spec.loader.exec_module(api)
     seen = []
     monkeypatch.setattr(api, '_secret', lambda name: seen.append(name) or '')
@@ -48,7 +48,7 @@ def test_ack_route_uses_only_requested_gemini_provider_and_rejects_unbounded_inp
 
 
 def test_openai_speed_is_validated_at_session_output_and_pronunciation_is_explicit():
-    from gemini_live_chat import live, openai_rt
+    from dawn2_voice import live, openai_rt
     cfg = live.resolve_persona(live.settings({'openai_speed': 1.15}))
     session = openai_rt.build_session(cfg)
     assert cfg['openai_speed'] == 1.15
@@ -61,7 +61,7 @@ def test_openai_speed_is_validated_at_session_output_and_pronunciation_is_explic
 
 
 def test_ack_tuning_logs_content_free_enums_only():
-    from gemini_live_chat import ack
+    from dawn2_voice import ack
     rec = ack.clean_stats({'ack_source': 'dropped(echo)', 'ack_latency': 300, 'text': 'private'})
     assert rec == {'ack_source': 'dropped(echo)', 'ack_latency': 300}
     assert ack.clean_stats({'ack_source': 'private', 'ack_latency': 12}) is None

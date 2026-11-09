@@ -14,13 +14,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gemini_live_chat import live, prefs, providers
+from dawn2_voice import live, prefs, providers
 
 ROOT = Path(__file__).resolve().parents[1]
 FREE = "AIzaFR...0000"
 PAID = "AIzaPA...1111"
 EK = "ek_picker_test_secret_42"
-URL = "/api/plugins/gemini-live-chat"
+URL = "/api/plugins/dawn2-voice"
 
 # Google's Prepay refusal at a $0 credit balance (checked ai.google.dev/gemini-api/docs/billing,
 # 2026-11-07: every key of that billing account gets HTTP 402 until credit is added).
@@ -125,7 +125,7 @@ def test_picker_options_show_presence_refusals_and_greyed_out_missing():
 # ── routes ──────────────────────────────────────────────────────────────────────────────────────
 
 def _load_api():
-    spec = importlib.util.spec_from_file_location("glc_plugin_api_picker", ROOT / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("d2v_plugin_api_picker", ROOT / "dashboard" / "plugin_api.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -190,7 +190,7 @@ def env(monkeypatch, tmp_path):
     plugins_state = types.ModuleType("hermes_cli.plugins_state")
     plugins_state.PluginState = PluginState
     config = types.ModuleType("hermes_cli.config")
-    config.load_config_readonly = lambda: {"plugins": {"entries": {"gemini-live-chat": {"settings": state["settings"]}}}}
+    config.load_config_readonly = lambda: {"plugins": {"entries": {"dawn2-voice": {"settings": state["settings"]}}}}
     cli = types.ModuleType("hermes_cli")
     cli.plugin_provider_requests, cli.plugins_state, cli.config = ppr, plugins_state, config
     for name, mod in (("agent", agent), ("agent.secret_scope", scope), ("hermes_cli", cli),
@@ -234,7 +234,7 @@ def test_status_carries_the_picker_with_auto_by_default(env):
 def test_choice_persists_in_the_plugin_data_dir_across_restarts_never_config(env):
     r = env["client"].post(f"{URL}/choice", json={"choice": "openai-codex"})
     assert r.status_code == 200 and r.json()["choice"] == "openai-codex"
-    stored = json.loads((env["home"] / "plugin-data" / "gemini-live-chat" / "state.json").read_text("utf-8"))
+    stored = json.loads((env["home"] / "plugin-data" / "dawn2-voice" / "state.json").read_text("utf-8"))
     assert stored["provider_choice"] == "openai-codex"
     assert not (env["home"] / "config.yaml").exists()
     client = env["start"]()  # gateway restart

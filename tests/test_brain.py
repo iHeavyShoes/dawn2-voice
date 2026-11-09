@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gemini_live_chat import latency, live, openai_rt, persona, providers
+from dawn2_voice import latency, live, openai_rt, persona, providers
 
 ROOT = Path(__file__).resolve().parents[1]
 FREE, PAID = "AIzaFREE...0001", "AIzaPAID...0002"
@@ -77,7 +77,7 @@ def test_voice_mode_is_the_v05_setup_byte_for_byte():
     setup = live.build_setup(cfg(brain="voice"))
     assert [d["name"] for d in setup["tools"][0]["functionDeclarations"]] == ["hermes_task", "end_call"]
     assert setup["systemInstruction"]["parts"][0]["text"] == persona.instructions(
-        "he", name="Hermes", gender="male", voice="Charon", engine="gemini")
+        "auto", name="Hermes", gender="male", voice="Charon", engine="gemini")
 
 
 def test_openai_hermes_session_never_answers_by_itself():
@@ -124,17 +124,17 @@ def test_latency_record_is_numbers_and_enums_only():
 
 
 def test_latency_route_logs_one_line_without_content(caplog):
-    spec = importlib.util.spec_from_file_location("glc_plugin_api_latency", ROOT / "dashboard" / "plugin_api.py")
+    spec = importlib.util.spec_from_file_location("d2v_plugin_api_latency", ROOT / "dashboard" / "plugin_api.py")
     api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api)
     app = FastAPI()
-    app.include_router(api.router, prefix="/api/plugins/gemini-live-chat")
+    app.include_router(api.router, prefix="/api/plugins/dawn2-voice")
     client = TestClient(app)
     caplog.set_level(logging.INFO)
-    r = client.post("/api/plugins/gemini-live-chat/latency", json={
+    r = client.post("/api/plugins/dawn2-voice/latency", json={
         "provider": "gemini-free", "brain": "hermes", "submit": 350, "first_text": 1900, "first_audio": 1200,
         "first_answer_audio": 2400, "ack": True, "silence_ms": 1000, "transcript": "SECRET-WORDS"})
     assert r.json() == {"ok": True}
     assert "voice latency provider=gemini-free brain=hermes kind=turn eos->submit=350ms" in caplog.text
     assert "SECRET-WORDS" not in caplog.text
-    assert client.post("/api/plugins/gemini-live-chat/latency", json={"x": 1}).json() == {"ok": False}
+    assert client.post("/api/plugins/dawn2-voice/latency", json={"x": 1}).json() == {"ok": False}

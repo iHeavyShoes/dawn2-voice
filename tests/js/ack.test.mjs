@@ -68,6 +68,21 @@ test('model ack guard: six words maximum, no echo, digits, facts, names or promi
     ['one short natural reaction', 'one short natural reaction please']
   ]) assert.equal(P.verifyAck(ack, turn), false, ack)
 })
+test('1.0 ack guard: one phrase only; a list of verbs or a second clause is dropped (he/en)', () => {
+  const turn = 'תבדוק מה עם החשבון שלי'
+  assert.notEqual(P.ackDropReason('אני בודק, אני יכול, אני מעביר', turn), '')
+  assert.equal(P.ackDropReason('רגע, אני בודק, אני מסתכל', turn), 'clauses')
+  assert.equal(P.ackDropReason('בודק, מסתכל, רגע', turn), 'clauses')
+  assert.equal(P.ackDropReason('Okay, looking, let me see.', 'check my account'), 'clauses')
+  assert.equal(P.ackDropReason('אה, הבנתי, רגע', turn), '')
+  assert.equal(P.ackDropReason('שאלה טובה, בוא נבדוק', turn), '')
+  assert.match(P.ACK_PROMPT, /Exactly ONE phrase/)
+  // every phrase of the fallback bank is itself one phrase (both genders)
+  for (const [lang, bank] of Object.entries(P.ACK_BANK)) for (const e of bank) for (const female of [false, true]) {
+    const text = (typeof e === 'string' ? e : e.t).replace(/\{([^|{}]+)\|([^|{}]+)\}/g, (_, m, f) => (female ? f : m))
+    assert.ok(P.ackClauses(text) <= 1, `${lang}: ${text}`) // 0: fillers only ("רגע.")
+  }
+})
 test('fallback bank: no topic echo, variety, recent exclusion, ~25% silence even on requests', () => {
   const rand = seeded(7)
   const spoken = []
