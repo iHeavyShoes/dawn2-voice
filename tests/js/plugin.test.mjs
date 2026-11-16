@@ -16,7 +16,7 @@ beforeEach(() => {
   sdk.requestImpl = async () => ({ status: 'streaming' })
   sdk.host.state.activeSessionId.value = 'sess-1'
   sdk.host.state.focusedSessionId.value = 'sess-1'
-  P.call.settings = { transcript_to_chat: 'chat_turn', half_duplex: false }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'chat_turn', half_duplex: false }
   P.call.detail = ''
 })
 
@@ -368,14 +368,14 @@ test('hang-up saves the transcript once to the open chat (queued turn) and to th
 })
 
 test('transcript_to_chat=off saves nothing; file mode writes only the data folder', async () => {
-  P.call.settings = { transcript_to_chat: 'off' }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'off' }
   let { ws, ctx } = await liveCall()
   ws.serve({ serverContent: { inputTranscription: { text: 'hello' } } })
   P.tearDown('')
   await settle()
   assert.equal(sdk.requests.length, 0)
   assert.equal(ctx.written.length, 0)
-  P.call.settings = { transcript_to_chat: 'file' }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'file' }
   ;({ ws, ctx } = await liveCall())
   ws.serve({ serverContent: { inputTranscription: { text: 'hello' } } })
   P.tearDown('')

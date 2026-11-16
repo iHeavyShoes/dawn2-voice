@@ -17,7 +17,7 @@ beforeEach(() => {
   sdk.requestImpl = async () => ({ status: 'streaming' })
   sdk.host.state.activeSessionId.value = 'sess-1'
   sdk.host.state.focusedSessionId.value = 'sess-1'
-  P.call.settings = { transcript_to_chat: 'off', half_duplex: false }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'off', half_duplex: false }
 })
 
 async function liveCall () {

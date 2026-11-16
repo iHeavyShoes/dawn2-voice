@@ -19,6 +19,15 @@ Flow (one detector per gateway process, owned by this module):
 4. ``pause()`` before a call started from the button; ``resume()`` after every hang-up, retrying
    while the browser still holds the device.
 
+Mic loss (v0.9): core tears the detector down by itself when the microphone dies for good (muted,
+unplugged, taken by another app: ``_detector_failed``) and never tells this module. ``state`` therefore
+is not trusted while it says ``listening``: ``status()`` / ``arm()`` / ``auto_arm()`` / ``recover()``
+first compare it with core (``owns_listener`` + ``is_listening``). A dead detector becomes ``error``
+and the next ``arm`` rebuilds ONLY the listener through ``start_listening``, throttled
+(``REARM_MIN_INTERVAL_S``), one log line per distinct failure. Nothing in this module restarts the
+gateway or the Desktop app, or touches a call: a ``paused`` detector (a call holds the mic) is never
+rebuilt by a status check.
+
 Nothing here touches ``config.yaml``, and the detector never runs unless the plugin's ``wake_word``
 setting is on and a window asked for it.
 """
@@ -28,6 +37,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -37,12 +47,45 @@ logger = logging.getLogger("dawn2-voice")
 EVENT = "wake.detected"
 CLAIM_TIMEOUT_S = 15.0
 RESUME_DELAYS_S = (0.3, 0.7, 1.5, 3.0, 6.0)
+#: v0.9: min gap between two rebuild attempts of the same settings after a failure (mic still missing):
+#: the renderer polls every 45 s, this keeps a faster caller from hammering the engine build.
+REARM_MIN_INTERVAL_S = 15.0
 DEFAULT_SENSITIVITY = 0.5
 #: sherpa's keyword model is English (BPE vocabulary): a phrase must be Latin letters.
 PHRASE_RE = re.compile(r"^[a-z][a-z' ]{1,38}[a-z]$")
-STATES = ("off", "arming", "listening", "paused", "error", "unsupported")
+STATES = ("off", "arming", "listening", "paused", "error", "unsupported", "non_owner")
+MIC_LOST_MESSAGE = ("The wake word's microphone stopped (muted, unplugged or taken by another app). "
+                    "Re-arming automatically.")
 CORE_WAKE_ON_MESSAGE = ("Hermes' own wake word is on (wake_word.enabled: true) and holds the microphone. "
                         "Turn it off so this plugin can listen.")
+
+
+NON_OWNER_MESSAGE = ("Wake word is owned by the gateway process. This dashboard/CLI process does not "
+                     "open the microphone; use the gateway-connected Desktop for wake calls.")
+IN_USE_MESSAGE = ("The wake-word microphone lease is held by another Hermes listener (in this or "
+                  "another Hermes process). This plugin cannot identify the holder; "
+                  "check for another running gateway or dashboard listener.")
+
+
+def is_gateway_process() -> bool:
+    """Fail closed on the actual command, not an inherited environment or config import.
+
+    sys.argv[0] covers console-script and python -m launchers alike. Consume only
+    Hermes' profile selector before the command; never search arbitrary argument
+    values for 'gateway run' (a dashboard/CLI argument could contain those words).
+    Unknown wrappers/commands must not acquire the machine-wide microphone lease.
+    """
+    args = sys.argv[1:]
+    while args:
+        if args[0] in ("-p", "--profile"):
+            if len(args) < 2:
+                return False
+            args = args[2:]
+        elif args[0].startswith("--profile=") or (args[0].startswith("-p") and len(args[0]) > 2):
+            args = args[1:]
+        else:
+            break
+    return args[:2] == ["gateway", "run"]
 
 
 def engine_config(phrase: str, sensitivity: float, input_device: Any = None) -> Dict[str, Any]:
@@ -91,9 +134,11 @@ class WakeManager:
                  broadcast: Callable[[str, Dict[str, Any]], None] = _broadcast,
                  spawn: Callable[[Callable[[], None], str], None] = _spawn,
                  sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 gateway_process: Optional[bool] = None) -> None:
         self._load, self._broadcast, self._spawn, self._sleep, self._clock = load, broadcast, spawn, sleep, clock
         self._lock = threading.Lock()
+        self.gateway_process = is_gateway_process() if gateway_process is None else gateway_process
         self.owner = object()  # the detector lease holder (tools.wake_word owner identity)
         self.state = "off"
         self.error = ""
@@ -104,6 +149,9 @@ class WakeManager:
         self._gen = 0  # bumped by every arm/disarm; stale worker threads back out
         self.detections = 0
         self.auto_armed = False  # v0.8: the gateway-side arm ran once in this process
+        self._last_attempt: Optional[float] = None  # clock() of the last rebuild attempt
+        self._last_warned = ""  # the last arm failure that was logged at WARNING (no log spam)
+        self._handoff = 0  # pause_listening calls in flight (state lags core's by a moment)
 
     # ── v0.8: arm without a window (gateway restart) ────────────────────────────────────────────
 
@@ -115,9 +163,12 @@ class WakeManager:
         Never disarms (only the explicit ``/wake/arm`` route does). Idempotent: a detector that is
         already arming, listening or paused (a call holds the mic) is left alone. When Hermes' own
         wake word is on, the microphone is not touched at all (one mic lease per machine)."""
+        if not self.gateway_process:
+            return self.status()
+        self._reconcile()
         with self._lock:
-            if self.auto_armed:
-                return self._status_locked()
+            if self.auto_armed and not self._lost_locked():
+                return self._status_locked()  # v0.9: a lost listener is rebuilt, not skipped
             self.auto_armed = True
             busy = self.state in ("arming", "listening", "paused")
         if busy:
@@ -132,6 +183,7 @@ class WakeManager:
     def refuse(self, msg: str) -> Dict[str, Any]:
         """Report why the detector is not armed without touching the engine. An active detector is
         left running (it already holds the lease)."""
+        self._reconcile()
         with self._lock:
             if self.state not in ("arming", "listening", "paused"):
                 self._gen += 1
@@ -141,27 +193,80 @@ class WakeManager:
     # ── status ──────────────────────────────────────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
+        self._reconcile()  # v0.9: report what core really has, not what this module last set
         with self._lock:
-            return {"state": self.state, "phrase": self.phrase, "error": self.error,
-                    "detections": self.detections}
+            return self._status_locked()
+
+    def _core_alive(self) -> Optional[bool]:
+        """True: core's detector is ours and running. False: gone or not ours. None: cannot tell (a
+        core without these two calls): the recorded state is then trusted, as before v0.9."""
+        try:
+            ww = self._load()
+            owns, running = getattr(ww, "owns_listener", None), getattr(ww, "is_listening", None)
+            if owns is None or running is None:
+                return None
+            return bool(owns(self.owner)) and bool(running())
+        except Exception:
+            return None
+
+    def _reconcile(self) -> None:
+        """``listening`` but core's detector is gone (mic lost: core's ``_detector_failed`` released the
+        lease and told nobody) -> ``error`` (``MIC_LOST_MESSAGE``). ``paused`` is never touched: a call (or a
+        claimed wake) holds the mic on purpose, and ``resume`` deals with a lease lost meanwhile.
+        ``arming`` belongs to its worker. Never calls core while holding ``self._lock``."""
+        with self._lock:
+            if self.state != "listening" or self._handoff:
+                return
+            gen = self._gen
+        if self._core_alive() is not False:
+            return
+        with self._lock:
+            if gen != self._gen or self.state != "listening" or self._handoff:
+                return  # something moved while core was asked
+            self._gen += 1  # a stale resume worker / claim watchdog backs out
+            self._token = None
+            self.state, self.error, self._last_attempt = "error", MIC_LOST_MESSAGE, None  # first rebuild is immediate
+        logger.warning("dawn2-voice: wake word listener is gone (microphone lost); re-arming on the next check")
+
+    def _lost_locked(self) -> bool:
+        """The listener was just found dead (``MIC_LOST_MESSAGE``) and no rebuild has been tried yet."""
+        return self.state == "error" and self.error == MIC_LOST_MESSAGE
+
+    def recover(self, phrase: str, sensitivity: float = DEFAULT_SENSITIVITY) -> Dict[str, Any]:
+        """The status route's hook: right after a mic loss is found, rebuild the listener once. A failed
+        rebuild stays an ``error`` (clear message) that the renderer's next ``/wake/arm`` retries, so the
+        status never hides the failure behind ``arming``."""
+        self._reconcile()
+        with self._lock:
+            lost = self._lost_locked()
+        return self.arm(phrase, sensitivity) if lost else self.status()
 
     # ── arm / disarm ────────────────────────────────────────────────────────────────────────────
 
     def arm(self, phrase: str, sensitivity: float = DEFAULT_SENSITIVITY, input_device: Any = None) -> Dict[str, Any]:
+        if not self.gateway_process:
+            return self.status()
         key = (phrase, float(sensitivity), input_device)
+        self._reconcile()  # v0.9: "listening" only counts while core's detector is really alive and ours
         with self._lock:
             if self._key == key and self.state in ("arming", "listening", "paused"):
                 return self._status_locked()
+            if (self._key == key and self.state == "error" and self._last_attempt is not None
+                    and self._clock() - self._last_attempt < REARM_MIN_INTERVAL_S):
+                return self._status_locked()  # just failed: report it, retry on a later call
         if self._key is not None and self._key != key:
             self.disarm()  # settings changed: rebuild the engine with the new phrase
         with self._lock:
             self._gen += 1
             gen = self._gen
             self._key, self.phrase, self.state, self.error = key, phrase, "arming", ""
+            self._last_attempt = self._clock()
         self._spawn(lambda: self._arm_worker(gen, key), "d2v-wake-arm")
         return self.status()
 
     def _arm_worker(self, gen: int, key: tuple) -> None:
+        if not self.gateway_process:
+            return
         phrase, sensitivity, input_device = key
         try:
             ww = self._load()
@@ -173,11 +278,14 @@ class WakeManager:
                                config=engine_config(phrase, sensitivity, input_device), external_audio=False)
         except Exception as e:
             if type(e).__name__ == "WakeWordInUse":
-                msg = ("The microphone's wake-word listener is already in use, most likely by Hermes' own "
-                       "wake word. Turn that off (wake_word.enabled: false) so this plugin can listen.")
+                msg = IN_USE_MESSAGE
             else:
-                msg = f"The wake word could not start: {str(e)[:200] or type(e).__name__}"
-            logger.warning("dawn2-voice: wake word not armed: %s", msg)
+                detail = str(e.__cause__ or e)[:200] or type(e).__name__
+                msg = (f"The wake word could not start: {detail}. "
+                       "It retries automatically (the microphone may be muted or missing).")
+            # one WARNING per distinct failure: a retry every poll must not fill the log
+            (logger.debug if msg == self._last_warned else logger.warning)("dawn2-voice: wake word not armed: %s", msg)
+            self._last_warned = msg
             self._fail(gen, "error", msg)
             return
         with self._lock:
@@ -185,7 +293,7 @@ class WakeManager:
                 stale = True
             else:
                 stale = False
-                self.state = "listening"
+                self.state, self._last_warned = "listening", ""
         if stale:
             self._stop_engine(ww)
             return
@@ -207,6 +315,7 @@ class WakeManager:
             self._gen += 1
             was = self.state
             self.state, self.error, self._key, self._token = "off", "", None, None
+            self._last_attempt, self._last_warned = None, ""
         if was in ("listening", "paused", "arming"):
             try:
                 self._stop_engine(self._load())
@@ -218,20 +327,26 @@ class WakeManager:
 
     def _on_wake(self) -> None:
         """Detector thread: free the microphone, then tell the windows (the call opens its own mic)."""
-        try:
-            ww = self._load()
-            if not ww.pause_listening(owner=self.owner):
-                return
-        except Exception:
-            logger.debug("dawn2-voice: wake pause failed", exc_info=True)
-            return
-        token = secrets.token_hex(8)
         with self._lock:
-            self.state = "paused"
-            self._token, self._token_at = token, self._clock()
-            self.detections += 1
-            gen = self._gen
-            phrase = self.phrase
+            self._handoff += 1  # core's detector is about to stop on purpose: not a mic loss
+        try:
+            try:
+                ww = self._load()
+                if not ww.pause_listening(owner=self.owner):
+                    return
+            except Exception:
+                logger.debug("dawn2-voice: wake pause failed", exc_info=True)
+                return
+            token = secrets.token_hex(8)
+            with self._lock:
+                self.state = "paused"
+                self._token, self._token_at = token, self._clock()
+                self.detections += 1
+                gen = self._gen
+                phrase = self.phrase
+        finally:
+            with self._lock:
+                self._handoff -= 1
         logger.info("dawn2-voice: wake word heard; offering the call to the open windows")
         try:
             self._broadcast(EVENT, {"token": token, "phrase": phrase})
@@ -262,19 +377,25 @@ class WakeManager:
     def pause(self) -> bool:
         """Release the mic before a call opens its own (no-op when not armed). True when the detector
         is ours and is now paused, so the caller knows to resume it after the call."""
+        self._reconcile()  # a dead listener is not "ours and paused": nothing to hand back later
         with self._lock:
             if self.state not in ("listening", "paused"):
                 return False
             self._token = None
+            self._handoff += 1
         try:
-            ok = bool(self._load().pause_listening(owner=self.owner))
-        except Exception:
-            return False
-        if ok:
+            try:
+                ok = bool(self._load().pause_listening(owner=self.owner))
+            except Exception:
+                return False
+            if ok:
+                with self._lock:
+                    if self.state == "listening":
+                        self.state = "paused"
+            return ok
+        finally:
             with self._lock:
-                if self.state == "listening":
-                    self.state = "paused"
-        return ok
+                self._handoff -= 1
 
     def resume(self) -> bool:
         """Re-arm after a hang-up. The browser may hold the device for a moment after its tracks
@@ -287,7 +408,9 @@ class WakeManager:
         return True
 
     def _resume_worker(self, gen: int) -> None:
-        last = ""
+        if not self.gateway_process:
+            return
+        last, lost = "", False
         for delay in RESUME_DELAYS_S:
             self._sleep(delay)
             with self._lock:
@@ -299,17 +422,32 @@ class WakeManager:
                         if gen == self._gen and self.state == "paused":
                             self.state, self.error = "listening", ""
                     return
-                last = "the listener is no longer ours"
+                last, lost = "the listener is no longer ours", True
                 break
             except Exception as e:
                 last = str(e)[:200] or type(e).__name__
+        if lost:
+            # core dropped the detector while it was paused (e.g. the mic vanished during the call). The call
+            # is over (this is the hang-up resume), so rebuild ONLY the listener, right here.
+            with self._lock:
+                if gen != self._gen or self.state != "paused" or self._key is None:
+                    return
+                key = self._key
+                self.state, self.error, self._last_attempt = "arming", "", self._clock()
+            logger.info("dawn2-voice: wake word listener was dropped during the call; rebuilding it")
+            self._arm_worker(gen, key)
+            return
         with self._lock:
             if gen == self._gen and self.state == "paused":
                 self.state = "error"
-                self.error = f"The wake word could not re-open the microphone: {last}. Reload the plugin to retry."
+                # transient (browser still holds the device): the renderer's next /wake/arm resumes again
+                self.error = f"The wake word could not re-open the microphone: {last}. Retrying automatically."
         logger.warning("dawn2-voice: wake word not resumed after the call: %s", last)
 
     def _status_locked(self) -> Dict[str, Any]:
+        if not self.gateway_process:
+            return {"state": "non_owner", "phrase": self.phrase, "error": NON_OWNER_MESSAGE,
+                    "detections": self.detections}
         return {"state": self.state, "phrase": self.phrase, "error": self.error, "detections": self.detections}
 
 

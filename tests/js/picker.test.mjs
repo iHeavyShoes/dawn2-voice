@@ -17,7 +17,7 @@ beforeEach(async () => {
   sdk.notes.length = 0
   P.ui.status = null
   P.ui.saving = false
-  P.call.settings = { transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he' }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he' }
   P.call.detail = ''
 })
 

@@ -15,7 +15,7 @@ beforeEach(async () => {
     setTimeout: (fn, ms) => { const id = Symbol(); timers.set(id, { fn, ms }); return id }, clearTimeout: id => timers.delete(id) })
   sdk.requests.length = 0
   sdk.requestImpl = async () => ({ status: 'streaming' })
-  P.call.settings = { language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', transcript_to_chat: 'off' }
+  P.call.settings = { interim_guard_ms: 0, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', transcript_to_chat: 'off' }
 })
 const ev = payload => ({ session_id: 'sess-1', payload })
 const AUDIO = { inlineData: { data: 'AAAAAA==' } }

@@ -37,6 +37,7 @@ def test_ack_route_uses_only_requested_gemini_provider_and_rejects_unbounded_inp
     from dawn2_voice import ack
     spec = importlib.util.spec_from_file_location('d2v_ack_routes', ROOT / 'dashboard/plugin_api.py')
     api = importlib.util.module_from_spec(spec); spec.loader.exec_module(api)
+    monkeypatch.setattr(api, "_settings", lambda: {"ack_source": "model"})
     seen = []
     monkeypatch.setattr(api, '_secret', lambda name: seen.append(name) or '')
     assert api.flow_ack({'provider': 'gemini-paid', 'utterance': 'היי זה מעניין', 'previous_sentence': 'כן.'}) == {'text': ''}

@@ -142,6 +142,9 @@ def settings(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "half_duplex": raw.get("half_duplex") is True,
         "api_version": pick("api_version", lambda v: v in API_VERSIONS, DEFAULT_API_VERSION),
         "brain": pick("brain", lambda v: v in BRAINS, DEFAULT_BRAIN),
+        "ack_source": pick("ack_source", lambda v: v in ("bank", "model"), "bank"),
+        "progress_first_ms": pick("progress_first_ms", lambda v: type(v) is int and 0 <= v <= 86400000, 75000),
+        "progress_every_ms": pick("progress_every_ms", lambda v: type(v) is int and 0 <= v <= 86400000, 35000),
         # v0.4: the provider chain (order of providers.PROVIDERS ids) and the OpenAI Realtime engine.
         "providers": _providers(raw.get("providers"), problems),
         # 1.0: which providers may take over a call that is already running.
@@ -452,7 +455,7 @@ def client_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("model", "voice", "language", "transcript_to_chat", "half_duplex", "persona_name",
             "persona_gender", "identity_source", "transcription_languages", "providers",
             "openai_model", "openai_voice", "brain", "silence_ms", "persona_name_he",
-            "wake_word", "wake_surface", "debug_picker")
+            "wake_word", "wake_surface", "debug_picker", "ack_source", "progress_first_ms", "progress_every_ms")
     out = {k: cfg[k] for k in keys if k in cfg}
     if cfg.get("wake_word"):
         out["wake_phrase"] = effective_wake_phrase(cfg)

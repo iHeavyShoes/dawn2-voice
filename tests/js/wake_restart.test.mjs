@@ -41,7 +41,7 @@ beforeEach(async () => {
   sdk.host.state.activeSessionId.value = 'sess-1'
   sdk.host.state.focusedSessionId.value = 'sess-1'
   delete sdk.host.state.gateway
-  P.call.settings = { transcript_to_chat: 'file', half_duplex: false, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', persona_gender: 'male', silence_ms: 1000 }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'file', half_duplex: false, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', persona_gender: 'male', silence_ms: 1000 }
   // The gateway's detector: `state` is what the CURRENT gateway process reports.
   backend = { enabled: true, state: 'listening' }
 })

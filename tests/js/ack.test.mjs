@@ -29,7 +29,7 @@ beforeEach(async () => {
   sdk.requestImpl = async () => ({ status: 'streaming' })
   sdk.host.state.activeSessionId.value = 'sess-1'
   sdk.host.state.focusedSessionId.value = 'sess-1'
-  P.call.settings = { transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', persona_gender: 'male', silence_ms: 1000 }
+  P.call.settings = { interim_guard_ms: 0, transcript_to_chat: 'chat_turn', half_duplex: false, language: 'he', persona_name: 'Ray', persona_name_he: 'ריי', persona_gender: 'male', silence_ms: 1000 }
 })
 
 const NAMES = ['Ray', 'ריי', 'hermes', 'הרמס']
@@ -98,9 +98,13 @@ test('fallback bank: no topic echo, variety, recent exclusion, ~25% silence even
   assert.ok(silent > 200 && silent < 300, String(silent))
   assert.ok(new Set(spoken).size > 20)
 })
-test('unfinished turns have no acknowledgement (he/en)', () => {
-  for (const text of ['חשבתי על זה אבל', 'I was thinking and', 'מבחינת השינוי', 'a thing'])
-    assert.equal(P.pickAck(text, { rand: () => .99 }), '')
+test('bank selection ignores unfinished content; classifier separately delays submission', () => {
+  const choices = ['חשבתי על זה אבל', 'I was thinking and', 'מבחינת השינוי', 'a thing'].map(text => {
+    P.resetAckMemory()
+    return P.pickAck(text, { rand: () => .99 })
+  })
+  assert.ok(choices[0])
+  assert.equal(new Set(choices).size, 1)
 })
 
 // ── in a call: the 900 ms rule ─────────────────────────────────────────────────────────────────

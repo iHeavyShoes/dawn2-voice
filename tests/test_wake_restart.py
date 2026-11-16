@@ -68,7 +68,7 @@ def test_restart_new_process_detector_gone_then_re_armed():
     run_now = lambda fn, name: fn()  # noqa: E731
 
     def process():
-        return wake.WakeManager(load=lambda: engine, broadcast=lambda e, p: None, spawn=run_now,
+        return wake.WakeManager(gateway_process=True, load=lambda: engine, broadcast=lambda e, p: None, spawn=run_now,
                                 sleep=lambda s: None)
 
     first = process()
@@ -85,6 +85,7 @@ def test_restart_new_process_detector_gone_then_re_armed():
 
 def _import_api(monkeypatch, *, in_hermes: bool, settings: dict, core_on: bool, manager):
     """Import plugin_api.py the way the gateway mounts it, with Hermes' config faked."""
+    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
     if in_hermes:
         cli = types.ModuleType("hermes_cli")
         cfg = types.ModuleType("hermes_cli.config")
@@ -105,7 +106,7 @@ def _import_api(monkeypatch, *, in_hermes: bool, settings: dict, core_on: bool, 
 
 
 def _manager(engine):
-    return wake.WakeManager(load=lambda: engine, broadcast=lambda e, p: None, spawn=lambda fn, name: fn(),
+    return wake.WakeManager(gateway_process=True, load=lambda: engine, broadcast=lambda e, p: None, spawn=lambda fn, name: fn(),
                             sleep=lambda s: None)
 
 

@@ -68,6 +68,19 @@ class FakeEngine:
         self.owner = None
         return True
 
+    def owns_listener(self, owner):
+        return self.owner is not None and owner is self.owner
+
+    def is_listening(self):
+        """Core's ``det.running``: the reader thread is alive (a paused detector has none)."""
+        return self.owner is not None and not self.paused
+
+    def lose_mic(self):
+        """Core's ``_detector_failed`` after ``microphone recovery exhausted``: detector torn down, lease
+        released, nobody told."""
+        self.calls.append(("mic_lost",))
+        self.owner, self.paused = None, False
+
     def say_phrase(self):
         """The detector thread fires (the real one calls on_wake from its own thread)."""
         self.on_wake()
@@ -97,7 +110,7 @@ def rig():
                 return
             pending.pop(idx)[1]()
 
-    m = wake.WakeManager(load=lambda: engine, broadcast=lambda e, p: events.append((e, p)),
+    m = wake.WakeManager(gateway_process=True, load=lambda: engine, broadcast=lambda e, p: events.append((e, p)),
                          spawn=spawn, sleep=sleeps.append, clock=clock)
     return types.SimpleNamespace(m=m, engine=engine, events=events, sleeps=sleeps, clock=clock, pending=pending, run=run)
 
@@ -173,13 +186,14 @@ def test_core_wake_word_on_means_in_use_and_a_clear_message(rig):
     rig.run()
     st = rig.m.status()
     assert st["state"] == "error"
-    assert "wake_word.enabled: false" in st["error"]
+    assert "another Hermes" in st["error"]
+    assert "wake_word.enabled" not in st["error"]
 
 
 def test_no_engine_in_this_hermes_is_unsupported():
     def load():
         raise ImportError("no tools.wake_word")
-    m = wake.WakeManager(load=load, broadcast=lambda *a: None, spawn=lambda fn, n: fn(), sleep=lambda s: None)
+    m = wake.WakeManager(gateway_process=True, load=load, broadcast=lambda *a: None, spawn=lambda fn, n: fn(), sleep=lambda s: None)
     m.arm("hey ray")
     assert m.status()["state"] == "unsupported"
 

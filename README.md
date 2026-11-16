@@ -15,11 +15,18 @@ written. The request and the full answer stay in the chat as ordinary rows.
   classifier, not the model, decides what counts as a turn. On OpenAI the server never creates a
   response by itself (`create_response: false`). On Gemini, any turn that doesn't read Hermes'
   text is never played. So answers can't come from the voice model, even when prompting fails.
-- **Acks are guarded.** While Hermes works, the voice may say one short flow-only reaction
-  ("אה, הבנתי, רגע", "let me see"). It comes from a separate tiny request that sees only your last
-  utterance and the previous Hermes sentence. A guard rejects anything with facts, names, numbers,
-  echoes or more than one clause, and a phrase bank or silence takes its place. An ack is never
-  the answer.
+- **Acks are neutral by default.** `ack_source: bank` chooses from 32 Hebrew and 24 English
+  content-free holding phrases ("בודק", "רגע אחד", "One moment"). Selection uses only the active
+  call language, persona gender, randomness and recent-repeat memory, never the turn's content.
+  About 25% of turns stay silent; a fast Hermes answer suppresses the ack. No model ack request
+  is made. `ack_source: model` explicitly restores the legacy content-reacting request (last
+  utterance + previous Hermes sentence only), guard and bank fallback.
+- **Long waits have bounded progress.** In Hermes mode, after 75 seconds of silence during a
+  running turn, the voice says a short progress phrase in the active call language, then every
+  randomized 30–40 seconds. Apologies are eligible only from the second progress phrase.
+  Reply playback resets the first-silence window; speech/playback blocks progress, real replies
+  preempt it, and interruption, turn end or hang-up cancels it. Progress is never held/resumed
+  as a reply. Set either `progress_first_ms` or `progress_every_ms` to `0` to disable.
 - **Full readout.** Hermes' reply is read while it streams, sentence by sentence (markdown, code
   and URLs are made speakable). At the end it is reconciled with the final text: every sentence is
   read, and none twice. If you interrupt with "ok" or "כן", reading resumes from the start of the
@@ -77,6 +84,9 @@ next call.
 | Key | Default | Meaning |
 |---|---|---|
 | `brain` | `hermes` | `hermes`: the chat model answers and the voice only reads. `voice`: the voice model chats itself and delegates (faster, but answers are the voice model's own). |
+| `ack_source` | `bank` | Neutral bank by default; `model` opts in to legacy guarded model reactions. |
+| `progress_first_ms` | `75000` | First progress after silence in a running Hermes turn; `0` disables. |
+| `progress_every_ms` | `35000` | Later cadence, randomized ±1/7; `0` disables. |
 | `providers` | `gemini-free,openai-codex,gemini-paid` | The fallback chain, in order. Leave an id out to never use it. |
 | `fallback_mid_call` | `gemini-free,gemini-paid` | Providers that may take over a call that is already running (`all`, `none`, or ids). |
 | `persona_name` | empty | The voice's name. Empty: the agent name from the profile's `SOUL.md` (`You are Ray ...`), else `Hermes`. Only the name is sent to the provider. |
@@ -125,7 +135,8 @@ hermes config set plugins.entries.dawn2-voice.settings.wake_word true
   - the text Hermes wrote for it to read;
   - the last few spoken turns;
   - the agent's name.
-  After a provider switch, the recent turns also go to the next provider. A guarded ack sends only
+  After a provider switch, the recent turns also go to the next provider. Only opt-in
+  `ack_source: model` sends an extra ack request containing
   your last utterance and the previous Hermes sentence: to Gemini Flash on Google's host, or as an
   out-of-band text response on the OpenAI connection.
 - **Not sent:** your chat history, your files, or the `SOUL.md` text.

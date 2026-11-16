@@ -147,7 +147,7 @@ export function makeCtx (overrides = {}) {
     rests,
     written,
     mint: async () => ({ url: 'wss://example.invalid/ws?access_token=auth_tokens/x', setup: { setup: { model: 'models/gemini-3.8-live' } } }),
-    status: () => ({ available: true, settings: { transcript_to_chat: 'chat_turn' } }),
+    status: () => ({ available: true, settings: { interim_guard_ms: 0, transcript_to_chat: 'chat_turn' } }),
     choose: async body => ({ choice: body.choice, persistent: true, options: [] }),
     rest: (path, opts) => {
       rests.push({ path, opts })

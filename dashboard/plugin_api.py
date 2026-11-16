@@ -241,6 +241,8 @@ def latency_report(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 @router.post("/ack")
 def flow_ack(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Gemini flow text only; OpenAI uses a tool-free out-of-band text response on its own wire."""
+    if _settings().get("ack_source", "bank") != "model":
+        return {"text": ""}
     body = body if isinstance(body, dict) else {}
     pid, utterance, previous = body.get("provider"), body.get("utterance"), body.get("previous_sentence", "")
     if (pid not in (providers.GEMINI_FREE, providers.GEMINI_PAID)
@@ -304,7 +306,12 @@ def _auto_arm(reason: str) -> None:
 @router.get("/wake")
 def wake_status() -> Dict[str, Any]:
     _auto_arm("first request")  # lazy path (plugin host isolation imports this module on demand)
-    return _wake_status(wake.manager(), _settings())
+    m, cfg = wake.manager(), _settings()
+    if cfg.get("wake_word") and not _core_wake_on():
+        # v0.9: a listener core tore down after a mic loss is reported as it is (error) and rebuilt here,
+        # throttled; only the wake-word listener, never the gateway, Desktop or a call (paused is left alone)
+        m.recover(live.effective_wake_phrase(cfg), cfg.get("wake_sensitivity", live.DEFAULT_WAKE_SENSITIVITY))
+    return _wake_status(m, cfg)
 
 
 @router.post("/wake/arm")
@@ -332,10 +339,10 @@ def _in_hermes() -> bool:
 
 
 def _arm_on_mount() -> None:
-    """Route mount = this module's import by the gateway (``_mount_one_plugin_api``). Arm in the
+    """Both gateway and standalone dashboard mount these routes; only gateway may arm. Arm in the
     background so a slow first engine build never delays the server start. Outside Hermes (tests,
     ``hermes plugins validate``) nothing runs."""
-    if _in_hermes():
+    if wake.is_gateway_process() and _in_hermes():
         wake._spawn(lambda: _auto_arm("startup"), "d2v-wake-auto-arm")
 
 
